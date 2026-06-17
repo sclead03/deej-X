@@ -44,7 +44,7 @@ type SliderMoveEvent struct {
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
 
 // NewSerialIO creates a SerialIO instance that uses the provided deej
-// instance's connection info to establish communications with the arduino chip
+// instance's connection info to establish communications with SERENITY
 func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	logger = logger.Named("serial")
 
@@ -65,7 +65,7 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	return sio, nil
 }
 
-// Start attempts to connect to our arduino chip
+// Start attempts to connect to SERENITY
 func (sio *SerialIO) Start() error {
 
 	// don't allow multiple concurrent connections
@@ -99,7 +99,6 @@ func (sio *SerialIO) Start() error {
 	sio.conn, err = serial.Open(sio.connOptions)
 	if err != nil {
 
-		// might need a user notification here, TBD
 		sio.logger.Warnw("Failed to open serial connection", "error", err)
 		return fmt.Errorf("open serial connection: %w", err)
 	}

@@ -5,22 +5,21 @@
 # windows only - you can use 'deej.current' to control the currently active app (whether full-screen or not)
 # windows only - you can use a device's full name, i.e. "Speakers (Realtek High Definition Audio)", to bind it. this works for both output and input devices
 # windows only - you can use 'system' to control the "system sounds" volume
-# important: slider indexes start at 0, regardless of which analog pins you're using!
+# SERENITY channel layout: index 0 = master volume encoder, indices 1-5 = analog faders
 slider_mapping:
   0: master
   1: chrome.exe
   2: spotify.exe
-  3:
-    - pathofexile_x64.exe
-    - rocketleague.exe
-  4: discord.exe
+  3: discord.exe
+  4: deej.unmapped
+  5: deej.unmapped
 
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false
 
-# settings for connecting to the arduino board
+# settings for connecting to SERENITY
 com_port: COM4
-baud_rate: 9600
+baud_rate: 115200
 
 # adjust the amount of signal noise reduction depending on your hardware quality
 # supported values are "low" (excellent hardware), "default" (regular hardware) or "high" (bad, noisy hardware)

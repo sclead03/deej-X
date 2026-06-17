@@ -1,5 +1,5 @@
-// Package deej provides a machine-side client that pairs with an Arduino
-// chip to form a tactile, physical volume control system/
+// Package deej provides a machine-side client that pairs with the SERENITY
+// hardware to form a tactile, physical volume control system.
 package deej
 
 import (
@@ -141,7 +141,7 @@ func (d *Deej) run() {
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
-	// connect to the arduino for the first time
+	// connect to SERENITY for the first time
 	go func() {
 		if err := d.serial.Start(); err != nil {
 			d.logger.Warnw("Failed to start first-time serial connection", "error", err)

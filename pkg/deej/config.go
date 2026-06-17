@@ -55,7 +55,7 @@ const (
 	configKeyNoiseReductionLevel = "noise_reduction"
 
 	defaultCOMPort  = "COM4"
-	defaultBaudRate = 9600
+	defaultBaudRate = 115200
 )
 
 // has to be defined as a non-constant because we're using path.Join

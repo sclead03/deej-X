@@ -26,6 +26,7 @@ type Deej struct {
 	serial   *SerialIO
 	sessions *sessionMap
 	display  *DisplayManager
+	hid      *HIDManager
 
 	stopChannel chan bool
 	version     string
@@ -85,6 +86,14 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	}
 
 	d.display = display
+
+	hidManager, err := NewHIDManager(d, logger)
+	if err != nil {
+		logger.Errorw("Failed to create HIDManager", "error", err)
+		return nil, fmt.Errorf("create new HIDManager: %w", err)
+	}
+
+	d.hid = hidManager
 
 	logger.Debug("Created deej instance")
 
@@ -150,6 +159,9 @@ func (d *Deej) run() {
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
+	// start HID device watcher
+	d.hid.Start()
+
 	// connect to SERENITY for the first time
 	go func() {
 		if err := d.serial.Start(); err != nil {
@@ -201,6 +213,7 @@ func (d *Deej) stop() error {
 
 	d.config.StopWatchingConfigFile()
 	d.serial.Stop()
+	d.hid.Stop()
 
 	// release the session map
 	if err := d.sessions.release(); err != nil {

@@ -26,6 +26,8 @@ type CanonicalConfig struct {
 	InvertSliders       bool
 	NoiseReductionLevel string
 	ChannelNames        [numChannels]string
+	IconDir             string
+	IconConversion      [numChannels]string
 
 	logger             *zap.SugaredLogger
 	notifier           Notifier
@@ -54,9 +56,13 @@ const (
 	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
 	configKeyChannelNames        = "channel_names"
+	configKeyIconDir             = "icon_dir"
+	configKeyIconConversion      = "icon_conversion"
 
-	defaultCOMPort  = "COM4"
-	defaultBaudRate = 115200
+	defaultCOMPort        = "COM4"
+	defaultBaudRate       = 115200
+	defaultIconDir        = "icons"
+	defaultIconConversion = "dither"
 )
 
 // has to be defined as a non-constant because we're using path.Join
@@ -91,6 +97,8 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
 	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
 	userConfig.SetDefault(configKeyChannelNames, []string{})
+	userConfig.SetDefault(configKeyIconDir, defaultIconDir)
+	userConfig.SetDefault(configKeyIconConversion, defaultIconConversion)
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -149,7 +157,9 @@ func (cc *CanonicalConfig) Load() error {
 		"sliderMapping", cc.SliderMapping,
 		"connectionInfo", cc.ConnectionInfo,
 		"invertSliders", cc.InvertSliders,
-		"channelNames", cc.ChannelNames)
+		"channelNames", cc.ChannelNames,
+		"iconDir", cc.IconDir,
+		"iconConversion", cc.IconConversion)
 
 	return nil
 }
@@ -245,6 +255,21 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	names := cc.userConfig.GetStringSlice(configKeyChannelNames)
 	for i := 0; i < numChannels && i < len(names); i++ {
 		cc.ChannelNames[i] = names[i]
+	}
+
+	cc.IconDir = cc.userConfig.GetString(configKeyIconDir)
+
+	conversions := cc.userConfig.GetStringSlice(configKeyIconConversion)
+	defaultConv := defaultIconConversion
+	if len(conversions) > 0 {
+		defaultConv = conversions[0]
+	}
+	for i := 0; i < numChannels; i++ {
+		if i < len(conversions) {
+			cc.IconConversion[i] = conversions[i]
+		} else {
+			cc.IconConversion[i] = defaultConv
+		}
 	}
 
 	cc.logger.Debug("Populated config fields from vipers")

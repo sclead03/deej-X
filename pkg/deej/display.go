@@ -1,7 +1,11 @@
 package deej
 
 import (
+	"bytes"
+
 	"go.uber.org/zap"
+
+	"github.com/sclead03/deej-x/pkg/deej/icon"
 )
 
 // numChannels is the number of channel OLEDs on SERENITY (indices 0–4, mapped to faders 1–5).
@@ -75,27 +79,52 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 	}()
 }
 
-// pushAll sends names and icons for all channels. When force is true (connection event),
-// all channels are sent regardless of change tracking; when false (manual push),
-// unchanged channels are skipped.
+// pushAll sends names and icons for all channels. force=true (connection event) sends
+// everything regardless of change tracking; force=false (manual push) skips unchanged channels.
 func (dm *DisplayManager) pushAll(writer *SerialWriter, force bool) {
 	names := dm.deej.config.ChannelNames
+	iconDir := dm.deej.config.IconDir
 
 	for i := 0; i < numChannels; i++ {
+		iconConversion := dm.deej.config.IconConversion[i]
+
+		// name
 		name := names[i]
+		if force || name != dm.lastSentNames[i] {
+			if err := writer.SendChannelName(byte(i), name); err != nil {
+				dm.logger.Warnw("Failed to send channel name", "channel", i, "error", err)
+			} else {
+				dm.lastSentNames[i] = name
+				dm.logger.Debugw("Sent channel name", "channel", i, "name", name)
+			}
+		}
 
-		if !force && name == dm.lastSentNames[i] {
+		// icon: channel i (0-based) maps to slider index i+1; master is at 0 and skipped
+		targets, ok := dm.deej.config.SliderMapping.get(i + 1)
+		if !ok || len(targets) == 0 {
+			continue
+		}
+		processName := targets[0]
+		if processName == "master" {
 			continue
 		}
 
-		if err := writer.SendChannelName(byte(i), name); err != nil {
-			dm.logger.Warnw("Failed to send channel name", "channel", i, "error", err)
+		bitmap, err := icon.Load(processName, iconDir, iconConversion)
+		if err != nil {
+			dm.logger.Debugw("No icon for channel", "channel", i, "process", processName, "error", err)
 			continue
 		}
 
-		dm.lastSentNames[i] = name
-		dm.logger.Debugw("Sent channel name", "channel", i, "name", name)
+		if !force && bytes.Equal(bitmap, dm.lastSentIcons[i]) {
+			continue
+		}
+
+		if err := writer.SendChannelIcon(byte(i), bitmap); err != nil {
+			dm.logger.Warnw("Failed to send channel icon", "channel", i, "error", err)
+			continue
+		}
+
+		dm.lastSentIcons[i] = bitmap
+		dm.logger.Debugw("Sent channel icon", "channel", i, "process", processName)
 	}
-
-	// TODO: push channel icons once icon loading is implemented
 }

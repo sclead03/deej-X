@@ -48,8 +48,8 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `baud_rate` | ✓ updated | Default changed to 115200 |
 | `slider_mapping` | ✓ existing | 6-channel SERENITY layout in default config |
 | `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
-| `icon_path` | pending | Path to icon source files; add when icon package is implemented |
-| `icon_conversion` | pending | `"threshold"` or `"dither"`; add when icon package is implemented |
+| `icon_dir` | pending | Directory containing PNG icon files; relative or absolute path |
+| `icon_conversion` | pending | `"dither"` (Floyd-Steinberg) or `"threshold"`; user chooses per preference |
 
 ---
 
@@ -104,7 +104,17 @@ Names are pushed via `SET_CHANNEL_NAME` on every connection event and on manual 
 - `MaxChannelNameLength = 15` (constant in `serial_writer.go`; revisit when firmware font size is finalized)
 - Config reload automatically picks up new names on the next manual push
 
-Icon streaming is **pending** — see TBD section.
+### ✓ 5. Channel Icon Streaming — COMPLETE
+
+Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual push.
+
+- Source: PNG files in `icon_dir` (config key), named after the process with `.exe` stripped (`chrome.png`, `spotify.png`)
+- `deej.unmapped` maps to `unmapped.png`; `system` maps to `system.png`; `master` slot is skipped
+- Conversion: configurable via `icon_conversion` — `"dither"` (Floyd-Steinberg) or `"threshold"`
+- Pipeline: load PNG → box-filter resize to 48×48 → composite on black → grayscale → 1-bit → pack to 768-byte SSD1306 page-order frame (40px horizontal zero-padding each side)
+- Implemented in `pkg/deej/icon/channel_icon.go` (`icon.Load`), wired into `display.go` `pushAll()`
+- Missing icon files are logged at debug level and skipped gracefully (no crash)
+- `lastSentIcons` change tracking prevents redundant re-sends on manual push
 
 ### ✓ 4. System Mic Mute via HID — COMPLETE (report validation pending TBD)
 
@@ -159,17 +169,6 @@ pkg/deej/
 
 ## Remaining Work
 
-### Icon Package (`pkg/deej/icon/` — new package, separate from existing `icon/icon.go`)
-
-Blocked on firmware TBDs. Once unblocked:
-
-1. Add `icon_path` and `icon_conversion` keys to `config.go` and `config.yaml`
-2. Implement `pkg/deej/icon/icon.go`:
-   - Load source images from `icon_path` (format TBD)
-   - Convert to 1-bit bitmap: threshold (clean line art) or Floyd-Steinberg dither (grayscale)
-   - Generate fallback X bitmap if no source file found
-3. Wire into `display.go` `pushAll()` — the icon push TODO is already marked there
-
 ### HID Report Validation
 
 One-line fill-in once firmware HID descriptor is known. See `handleReport` in `hid.go`.
@@ -187,20 +186,32 @@ Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/h
 | Fader/serial reading | ✓ | ✓ |
 | Bidirectional serial | ✓ | ✓ |
 | Channel name streaming | ✓ | ✓ |
-| Icon streaming | pending TBD | pending TBD |
+| Icon streaming | ✓ | ✓ |
 | HID device reading | ✓ | stub (retries silently) |
 | Mic mute toggle | ✓ (WASAPI) | best-effort (pactl) |
 
 ---
 
+## Icon Protocol — Decided
+
+| Item | Decision |
+|---|---|
+| Source file format | PNG, any resolution — host resizes at runtime |
+| File naming | Process name from `slider_mapping` with `.exe` stripped — `firefox.png`, `spotify.png` |
+| Displayed icon size | 48×48 pixels (user may adjust after seeing hardware) |
+| Wire format | 768 bytes — full 128×48 blue area in SSD1306 page order; icon centered (40px zero-padding each side horizontally, 0px vertically) |
+| Bit order | SSD1306 native: each byte = one column of 8 vertical pixels; bit 0 = topmost pixel of page |
+| Conversion | Configurable: `dither` (Floyd-Steinberg) or `threshold`; set via `icon_conversion` in `config.yaml` |
+| `master` slot (index 0) | Skip icon push — master OLED is encoder-controlled, not a channel display |
+| `deej.unmapped` slot | Use bundled default icon; user can override by placing `unmapped.png` in `icon_dir` |
+| `system` slot | Use bundled default icon; user can override by placing `system.png` in `icon_dir` |
+
+**TODO:** Design and bundle default icons for `deej.unmapped` and `system` slots. These ship with the package as fallback; user can drop their own file in `icon_dir` to override.
+
 ## TBD — Do Not Assume These
 
 | Item | Blocked on |
 |---|---|
-| Icon file format | User decision (format that produces best dot-matrix quality) |
-| Icon file naming convention | Format decision |
-| Icon dimensions (px) | Firmware font size / display layout finalization |
-| Bitmap bit order for SET_CHANNEL_ICON | Firmware direct SSD1306 write implementation |
 | Custom HID report format (mic mute) | RGB button hardware replacement + firmware HID descriptor |
 
 ---

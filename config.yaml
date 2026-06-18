@@ -8,25 +8,39 @@
 # SERENITY channel layout: index 0 = master volume encoder, indices 1-5 = analog faders
 slider_mapping:
   0: master
-  1: chrome.exe
+  1: firefox.exe
   2: spotify.exe
   3: discord.exe
   4: deej.unmapped
-  5: deej.unmapped
+  5: system
+
+# directory containing PNG icon files for channel OLEDs; relative to deej-x.exe or absolute
+icon_dir: icons
+
+# 1-bit conversion method per channel: "dither" (Floyd-Steinberg) or "threshold"
+# One entry per channel (indices 0-4, corresponding to faders 1-5). If only a 
+#single value is entered, it applies to all channels.
+# Dithering softens anti-aliased edges; threshold gives a hard binary cutoff.
+icon_conversion:
+  - threshold
+  - dithering
+  - dithering
+  - threshold
+  - threshold
 
 # display names for SERENITY channel OLEDs (indices 0-4, corresponding to faders 1-5)
 channel_names:
-  - Browser
+  - Firefox
   - Spotify
   - Discord
-  - Game
-  - Aux
+  - Unmapped
+  - System
 
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false
 
 # settings for connecting to SERENITY
-com_port: COM4
+com_port: COM8
 baud_rate: 115200
 
 # adjust the amount of signal noise reduction depending on your hardware quality

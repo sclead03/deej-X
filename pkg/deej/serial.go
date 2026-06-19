@@ -35,6 +35,7 @@ type SerialIO struct {
 	sliderMoveConsumers []chan SliderMoveEvent
 	connectedConsumers  []chan struct{}
 	beaconConsumers     []chan struct{}
+	deviceCmdConsumers  []chan DeviceCommand
 
 	writer *SerialWriter
 }
@@ -43,6 +44,22 @@ type SerialIO struct {
 type SliderMoveEvent struct {
 	SliderID     int
 	PercentValue float32
+}
+
+// DeviceCommand represents a single binary device->host command frame received
+// from SERENITY (escape-prefixed, mirroring the host->firmware protocol in serial_writer.go).
+type DeviceCommand struct {
+	CmdID   byte
+	Payload []byte
+}
+
+// inboundMessage is either a complete ASCII line (fader data / beacon) or a
+// parsed binary device->host command frame, produced by readFrames.
+type inboundMessage struct {
+	line    string
+	isCmd   bool
+	cmdID   byte
+	payload []byte
 }
 
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
@@ -119,17 +136,17 @@ func (sio *SerialIO) Start() error {
 		go func(ch chan struct{}) { ch <- struct{}{} }(consumer)
 	}
 
-	// read lines or await a stop
+	// read frames (lines or binary commands) or await a stop
 	go func() {
 		connReader := bufio.NewReader(sio.conn)
-		lineChannel := sio.readLine(namedLogger, connReader)
+		msgChannel := sio.readFrames(namedLogger, connReader)
 
 		for {
 			select {
 			case <-sio.stopChannel:
 				sio.close(namedLogger)
 				return
-			case line, ok := <-lineChannel:
+			case msg, ok := <-msgChannel:
 				if !ok {
 					// Read goroutine exited — device was unplugged.
 					namedLogger.Info("Serial device disconnected")
@@ -137,7 +154,11 @@ func (sio *SerialIO) Start() error {
 					go sio.reconnect()
 					return
 				}
-				sio.handleLine(namedLogger, line)
+				if msg.isCmd {
+					sio.handleDeviceCommand(namedLogger, msg.cmdID, msg.payload)
+				} else {
+					sio.handleLine(namedLogger, msg.line)
+				}
 			}
 		}
 	}()
@@ -182,6 +203,14 @@ func (sio *SerialIO) SubscribeToConnectEvents() chan struct{} {
 func (sio *SerialIO) SubscribeToBeaconEvents() chan struct{} {
 	ch := make(chan struct{})
 	sio.beaconConsumers = append(sio.beaconConsumers, ch)
+	return ch
+}
+
+// SubscribeToDeviceCommands returns a channel that receives every binary
+// device->host command frame SERENITY sends (e.g. CMD_REQUEST_ICON_REDRAW).
+func (sio *SerialIO) SubscribeToDeviceCommands() chan DeviceCommand {
+	ch := make(chan DeviceCommand)
+	sio.deviceCmdConsumers = append(sio.deviceCmdConsumers, ch)
 	return ch
 }
 
@@ -249,31 +278,83 @@ func (sio *SerialIO) reconnect() {
 	}
 }
 
-func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) chan string {
-	ch := make(chan string)
+// readFrames reads the serial stream byte by byte, distinguishing ASCII lines
+// (fader data, the SERENITY beacon) from binary device->host command frames.
+// 0x00 is an unambiguous escape byte — it never appears in ASCII fader data —
+// mirroring the escape-prefixed framing firmware already uses for host->firmware
+// commands (see serial_writer.go / processIncomingSerial in main.cpp).
+//
+// Frame format: [0x00][cmdID][lenLo][lenHi][...payload bytes...]. The payload
+// is read by exact length via io.ReadFull, so embedded \n/\r bytes can't
+// truncate it the way they would a naive line-based reader.
+func (sio *SerialIO) readFrames(logger *zap.SugaredLogger, reader *bufio.Reader) chan inboundMessage {
+	ch := make(chan inboundMessage)
 
 	go func() {
 		defer close(ch)
+		var lineBuf []byte
+
 		for {
-			line, err := reader.ReadString('\n')
+			b, err := reader.ReadByte()
 			if err != nil {
-
 				if sio.deej.Verbose() {
-					logger.Warnw("Failed to read line from serial", "error", err, "line", line)
+					logger.Warnw("Failed to read from serial", "error", err)
 				}
-
 				return
 			}
 
-			if sio.deej.Verbose() {
-				logger.Debugw("Read new line", "line", line)
+			if b == 0x00 {
+				cmdID, err := reader.ReadByte()
+				if err != nil {
+					return
+				}
+				lenLo, err := reader.ReadByte()
+				if err != nil {
+					return
+				}
+				lenHi, err := reader.ReadByte()
+				if err != nil {
+					return
+				}
+				length := int(lenLo) | int(lenHi)<<8
+
+				payload := make([]byte, length)
+				if length > 0 {
+					if _, err := io.ReadFull(reader, payload); err != nil {
+						return
+					}
+				}
+
+				if sio.deej.Verbose() {
+					logger.Debugw("Read device command", "cmdID", cmdID, "payloadLen", length)
+				}
+
+				ch <- inboundMessage{isCmd: true, cmdID: cmdID, payload: payload}
+				continue
 			}
 
-			ch <- line
+			lineBuf = append(lineBuf, b)
+			if b == '\n' {
+				line := string(lineBuf)
+				lineBuf = lineBuf[:0]
+
+				if sio.deej.Verbose() {
+					logger.Debugw("Read new line", "line", line)
+				}
+
+				ch <- inboundMessage{line: line}
+			}
 		}
 	}()
 
 	return ch
+}
+
+// handleDeviceCommand dispatches a parsed device->host command frame to all subscribers.
+func (sio *SerialIO) handleDeviceCommand(logger *zap.SugaredLogger, cmdID byte, payload []byte) {
+	for _, consumer := range sio.deviceCmdConsumers {
+		go func(ch chan DeviceCommand) { ch <- DeviceCommand{CmdID: cmdID, Payload: payload} }(consumer)
+	}
 }
 
 func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {

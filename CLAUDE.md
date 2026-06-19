@@ -67,7 +67,7 @@ All host → firmware commands use binary framing:
 - `LEN` is payload length in bytes, little-endian 16-bit
 - **Fire-and-forget** — no ACK, no retry; USB CDC serial reliability is sufficient
 
-**Assigned CMD_IDs:**
+**Assigned CMD_IDs (host → firmware):**
 
 | Name | CMD_ID | Payload | Description |
 |---|---|---|---|
@@ -78,6 +78,14 @@ All host → firmware commands use binary framing:
 | `SET_MIC_MUTE_STATE` | `0x05` | `[muted]` | `0x00` unmuted / `0x01` muted; host's current system mic mute state on connect |
 
 Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on connect and exposed via `SerialIO.Writer()`.
+
+**Assigned CMD_IDs (firmware → host):**
+
+| Name | CMD_ID | Payload | Description |
+|---|---|---|---|
+| `CMD_REQUEST_ICON_REDRAW` | `0x06` | `[channel_idx][x_offset][y_offset]` | Firmware's channel screensaver tick asking the host to re-render and re-stream that channel's icon at a new bounce position, instead of centered |
+
+CMD_ID `0x06` is unassigned in the host→firmware direction, so there's no ambiguity, but note the two directions are independent namespaces anyway — they're parsed by entirely separate programs/state machines sharing only the physical UART. Read by `SerialIO.readFrames()` in `serial.go` (the binary-frame branch of the byte-stream parser that also produces fader-data lines), dispatched via `SerialIO.SubscribeToDeviceCommands()`, handled in `display.go`'s `handleIconRedrawRequest`.
 
 ### ✓ 2. Connection Handshake and Push Trigger — COMPLETE
 
@@ -94,7 +102,7 @@ Both connection scenarios are handled:
 - Beacon received → push triggered
 
 **Device unplugged and replugged while host is running:**
-- `readLine` goroutine closes its channel on read error
+- `readFrames` goroutine closes its channel on read error
 - `Start()` goroutine detects closed channel → calls `close()` → spawns `reconnect()` goroutine
 - `reconnect()` calls `waitForSerialDevice()` (same hotplug path) then retries `Start()`
 
@@ -119,12 +127,12 @@ Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual 
 - Source: PNG files in `icon_dir` (config key), named after the process with `.exe` stripped (`chrome.png`, `spotify.png`)
 - `deej.unmapped` maps to `unmapped.png`; `system` maps to `system.png`; `master` slot is skipped
 - Conversion: per-channel, configurable via `icon_conversion` list — `"dither"` (Floyd-Steinberg) or `"threshold"`; a scalar value in config.yaml applies to all channels
-- Pipeline (transparent PNG): detect alpha → box-filter resize alpha channel to 48×48 → use alpha as content mask (transparent=off, opaque=on); apply dither or threshold to alpha values for edge softening
-- Pipeline (opaque PNG): box-filter resize RGB to 48×48 → grayscale → threshold or Floyd-Steinberg dither → 1-bit
-- Output: 768-byte SSD1306 page-order frame; 48×48 icon centered horizontally with 40px zero-padding each side
-- Implemented in `pkg/deej/icon/channel_icon.go` (`icon.Load`), wired into `display.go` `pushAll()`
+- Pipeline (transparent PNG): detect alpha → box-filter resize alpha channel to 36×36 → use alpha as content mask (transparent=off, opaque=on); apply dither or threshold to alpha values for edge softening
+- Pipeline (opaque PNG): box-filter resize RGB to 36×36 → grayscale → threshold or Floyd-Steinberg dither → 1-bit
+- Output: 768-byte SSD1306 page-order frame; 36×36 icon placed at a given offset within the 128×48 blue area (46px horizontal / 6px vertical padding when centered)
+- Implemented in `pkg/deej/icon/channel_icon.go`: `loadMono()` does decode/resize/dither, `packSSD1306(mono, leftPad, topPad)` packs at an arbitrary offset, `Load()` (centered) and `LoadAt()` (arbitrary offset) are thin wrappers. `Load` is wired into `display.go` `pushAll()`; `LoadAt` is used by `handleIconRedrawRequest` for screensaver bounce repositioning (see Feature 1's `CMD_REQUEST_ICON_REDRAW`).
 - Missing icon files are logged at debug level and skipped gracefully (no crash)
-- `lastSentIcons` change tracking prevents redundant re-sends on manual push
+- `lastSentIcons` change tracking prevents redundant re-sends on manual push; screensaver redraws also update `lastSentIcons` so a later centered push correctly notices the position changed
 
 ### ✓ 4. System Mic Mute via HID — COMPLETE (report validation pending TBD)
 
@@ -142,7 +150,7 @@ Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual 
 
 **Pending:** `handleReport` in `hid.go` currently triggers mute on any received report. Once the firmware HID descriptor is finalized, add a report format check there.
 
-### ✓ 6. Master State Sync on Connect — HOST COMPLETE (firmware handler pending)
+### ✓ 6. Master State Sync on Connect — COMPLETE (pending hardware verification)
 
 Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-coded to 512 on power-on because it has no way to know the host's actual current state.
 
@@ -150,7 +158,7 @@ Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-
 - Master volume source: `sessionMap.getMasterVolume()` reads the `"master"` session's `GetVolume()` (0.0–1.0 scalar), converted to raw `0–1023` (`uint16(vol*1023 + 0.5)`) to match the firmware's native domain
 - Mic mute source: `HIDManager.IsMicMuted()` → `MicMuter.IsMuted()` (Windows: `IAudioEndpointVolume.GetMute` on the default capture endpoint; Linux: `pactl get-source-mute @DEFAULT_SOURCE@`)
 - If the master session or mic state isn't available (e.g. session map not yet populated), the corresponding push is skipped rather than guessed
-- **Firmware side not yet implemented** — needs a handler for `0x04`/`0x05` that assigns into `masterVol` and the RGB button's mic-mute state respectively, then a reflash to pick it up. Until then this push is sent but ignored by firmware.
+- **Firmware side implemented** — `processCmd` in `main.cpp` now handles `0x04` (assigns `masterVol`, forces a bar redraw) and `0x05` (assigns `masterMuted`, forces an icon redraw + `applyRgbToHardware()`). Not yet bench-tested against real hardware.
 
 ---
 
@@ -161,7 +169,7 @@ pkg/deej/
   cmd/main.go                  — entry point
   deej.go                      — main Deej struct, lifecycle
   config.go                    — config loading (viper)
-  serial.go                    — serial I/O, fader parsing, connect/beacon events
+  serial.go                    — serial I/O: readFrames() byte-stream parser (ASCII lines + binary device->host command frames), fader parsing, connect/beacon/device-command events
   serial_writer.go             — host → firmware command framing (binary protocol)
   display.go                   — handshake, master state sync, name push sequencing, change tracking
   hid.go                       — HIDManager, MicMuter interface (toggle + query mute state), read loop
@@ -189,10 +197,6 @@ pkg/deej/
 
 ## Remaining Work
 
-### Firmware Handler for Master State Sync
-
-Host sends `SET_MASTER_VOLUME` (`0x04`) and `SET_MIC_MUTE_STATE` (`0x05`) on every beacon (see Feature 6), but firmware has no handler for them yet — frames are sent and currently ignored. Needs a firmware-side command parser that assigns the received value into `masterVol` and the RGB button's mic-mute state, plus a reflash to pick it up. Lives in the SERENITY-Firmware repo, not here.
-
 ### HID Report Validation
 
 One-line fill-in once firmware HID descriptor is known. See `handleReport` in `hid.go`.
@@ -200,6 +204,35 @@ One-line fill-in once firmware HID descriptor is known. See `handleReport` in `h
 ### Linux HID Enumeration
 
 Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/hidraw*` and matching VID/PID via `/sys/class/hidraw/<dev>/device/uevent`.
+
+### Screensaver Hardware Verification
+
+`CMD_REQUEST_ICON_REDRAW` handling, the 36×36 icon resize, and `readFrames()` all build and the existing unit-level logic is unchanged for normal (centered) pushes, but none of this has been exercised against real hardware yet — needs a bench test of the full idle → screensaver → wake cycle once the firmware side is flashed. See firmware CLAUDE.md "Current State → Implemented, pending hardware verification."
+
+### Process Group Channels (e.g. `deej.steam`)
+
+**Idea (not yet designed in detail):** a slider should be able to target a *named group* of processes defined in a separate file — e.g. a `SteamGames` group listing `cyberpunk2077.exe`, `thelastofus.exe`, `mahjong.exe`, etc. — instead of listing every process individually in `slider_mapping`. One slider would control the volume of whichever of those processes happens to be running, and the channel OLED would show a single representative icon (e.g. Steam's) rather than per-game icons.
+
+**Priority rule:** if a process is both (a) listed in the group file and (b) explicitly assigned to its own separate channel in `slider_mapping`, the explicit per-channel assignment wins — that process is excluded from the group for volume-control purposes (it shouldn't be controlled by two sliders at once).
+
+**Where this likely plugs in**, based on the existing special-target mechanism in `session_map.go`:
+- `specialTargetTransformPrefix` ("deej.") already dispatches to `applyTargetTransform()`, which currently only handles `deej.current` and `deej.unmapped`. A new case (`deej.steam`, or a generic `deej.group:<name>` if multiple groups are wanted) would read the group file, return all matching session keys as `resolvedTargets`, minus any process name that's also explicitly mapped to a *different* slider elsewhere in `SliderMapping` (the override case above) — `sessionMapped()` already walks the full mapping table, so the exclusion check can reuse that pattern.
+- The group file itself: format TBD ("doesn't need to be a .yaml" per discussion) — could be a new top-level config key (a path, like `icon_dir`) or a section inside `config.yaml`. Needs a decision before implementation.
+- Icon side: `display.go`'s `pushAll()` currently loads an icon by treating `targets[0]` as a literal process name (`icon.Load(processName, ...)`). A group-targeted channel would need a special case (similar to the existing `processName == "master"` skip) that loads a fixed group icon (e.g. `steam.png`) instead of trying to resolve one of the many underlying game executables.
+
+### Decouple Icon Selection from Process Name — DISCUSS FURTHER BEFORE IMPLEMENTATION
+
+**Current behavior:** icon association has nothing to do with `channel_names` (the OLED display label) — it's keyed entirely off `slider_mapping`. `pushAll()` in `display.go` takes `targets[0]` for a channel's slider mapping (e.g. `firefox.exe`) and `icon.Load()` lowercases it, strips `.exe`, and looks for that exact filename in `icon_dir` (`firefox.png`). Renaming the channel label to "Browser" has zero effect on icon lookup. Also: if a slider maps to multiple processes, only `targets[0]` is used for the icon — the rest are ignored for icon purposes.
+
+**Idea:** add an explicit, optional icon key per channel/slider (defaulting to the current process-name-derived behavior if unset, so existing configs don't break), so a channel labeled "Browser" mapped to `firefox.exe` could explicitly declare `icon: firefox` (or similar) without relying on the process name matching a filename. This also gives the process-group feature above (`deej.steam`) a clean way to declare its own representative icon explicitly instead of needing another special case.
+
+**Open questions to resolve before building this:** exact config shape (per-slider field vs. a separate icon-mapping section), precedence if both an explicit icon key and a same-named PNG exist, and whether this should land before or after the process-group feature since they overlap (a group's icon is a more general case of "icon not derived from process name").
+
+### Remove Dithering Support
+
+**Decided — remove.** Floyd-Steinberg dithering hasn't shown a visible benefit on icon edges at 36×36; for flat-color app logos, edge aliasing happens either way and dithering tends to scatter stray pixels near edges rather than smooth them. Removing it simplifies the pipeline and the user-facing config surface (one less thing to configure/explain).
+
+**What changes:** in `pkg/deej/icon/channel_icon.go`, collapse `loadMono` to always threshold (drop the `applyFloydSteinberg` / `applyFloydSteinbergAlpha` functions and the `switch conversion` branches in both the transparency and opaque paths). Remove the `icon_conversion` config key from `config.go`/`config.yaml` and `IconConversion` plumbing in `display.go`'s `pushAll()`/`handleIconRedrawRequest`. Update the "Conversion" row in this file's Icon Protocol — Decided table and the Config keys table.
 
 ---
 
@@ -225,8 +258,8 @@ Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/h
 |---|---|
 | Source file format | PNG, any resolution — host resizes at runtime |
 | File naming | Process name from `slider_mapping` with `.exe` stripped — `firefox.png`, `spotify.png` |
-| Displayed icon size | 48×48 pixels (user may adjust after seeing hardware) |
-| Wire format | 768 bytes — full 128×48 blue area in SSD1306 page order; icon centered (40px zero-padding each side horizontally, 0px vertically) |
+| Displayed icon size | 36×36 pixels (reduced from 48×48 to leave bounce room for the channel screensaver — see firmware CLAUDE.md Display Design) |
+| Wire format | 768 bytes — full 128×48 blue area in SSD1306 page order; icon at a given offset (46px horizontal / 6px vertical padding when centered) |
 | Bit order | SSD1306 native: each byte = one column of 8 vertical pixels; bit 0 = topmost pixel of page |
 | Conversion | Configurable: `dither` (Floyd-Steinberg) or `threshold`; set via `icon_conversion` in `config.yaml` |
 | `master` slot (index 0) | Skip icon push — master OLED is encoder-controlled, not a channel display |

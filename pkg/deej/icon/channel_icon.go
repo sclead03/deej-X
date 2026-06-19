@@ -12,21 +12,54 @@ import (
 )
 
 const (
-	IconWidth  = 48
-	IconHeight = 48
+	IconWidth  = 36
+	IconHeight = 36
 
 	wireWidth   = 128
-	wirePages   = 6                           // SSD1306 pages 2–7 (blue area, rows 16–63)
-	WireBytes   = wireWidth * wirePages       // 768
-	iconLeftPad = (wireWidth - IconWidth) / 2 // 40
+	wirePages   = 6                            // SSD1306 pages 2–7 (blue area, rows 16–63)
+	WireBytes   = wireWidth * wirePages        // 768
+	iconLeftPad = (wireWidth - IconWidth) / 2  // 46 — default horizontal centering
+	iconTopPad  = (wirePages*8 - IconHeight) / 2 // 6 — default vertical centering
 )
 
-// Load returns a 768-byte SSD1306 page-order frame for the given process name.
-// processName has ".exe" stripped and matched case-insensitively to a PNG file
-// in iconDir. "deej.unmapped" maps to "unmapped.png".
-// conversion is "dither" (Floyd-Steinberg) or "threshold" — used only for fully
-// opaque images. Transparent images use alpha as the content mask instead.
+// Load returns a 768-byte SSD1306 page-order frame for the given process name,
+// with the icon centered in the blue area. Equivalent to LoadAt with the
+// default centered offset.
 func Load(processName, iconDir, conversion string) ([]byte, error) {
+	return LoadAt(processName, iconDir, conversion, iconLeftPad, iconTopPad)
+}
+
+// LoadAt is identical to Load but places the icon at an arbitrary (xOffset, yOffset)
+// within the 128x48 blue area instead of centering it — used to reposition a
+// channel's icon during the screensaver bounce (CMD_REQUEST_ICON_REDRAW). Offsets
+// are clamped to keep the icon fully on-screen.
+func LoadAt(processName, iconDir, conversion string, xOffset, yOffset int) ([]byte, error) {
+	mono, err := loadMono(processName, iconDir, conversion)
+	if err != nil {
+		return nil, err
+	}
+
+	if xOffset < 0 {
+		xOffset = 0
+	} else if maxX := wireWidth - IconWidth; xOffset > maxX {
+		xOffset = maxX
+	}
+	if yOffset < 0 {
+		yOffset = 0
+	} else if maxY := wirePages*8 - IconHeight; yOffset > maxY {
+		yOffset = maxY
+	}
+
+	return packSSD1306(mono, xOffset, yOffset), nil
+}
+
+// loadMono decodes processName's icon PNG and converts it to a IconWidth x
+// IconHeight row-major 1-bit mask. processName has ".exe" stripped and is
+// matched case-insensitively to a PNG file in iconDir. "deej.unmapped" maps to
+// "unmapped.png". conversion is "dither" (Floyd-Steinberg) or "threshold" —
+// used only for fully opaque images. Transparent images use alpha as the
+// content mask instead.
+func loadMono(processName, iconDir, conversion string) ([]bool, error) {
 	base := strings.TrimSuffix(strings.ToLower(processName), ".exe")
 	if base == "deej.unmapped" {
 		base = "unmapped"
@@ -77,7 +110,7 @@ func Load(processName, iconDir, conversion string) ([]byte, error) {
 		}
 	}
 
-	return packSSD1306(mono), nil
+	return mono, nil
 }
 
 // hasTransparency returns true if any pixel in img has alpha < 255.
@@ -253,22 +286,22 @@ func applyFloydSteinbergAlpha(alpha []uint8, mono []bool) {
 	}
 }
 
-// packSSD1306 converts a row-major mono bitmap into a 768-byte SSD1306 page-order frame.
-// The 48×48 icon is centered horizontally with iconLeftPad (40) zero-padded columns each side.
-// Each byte = one column of 8 vertical pixels; bit 0 = topmost pixel of that page row.
-func packSSD1306(mono []bool) []byte {
+// packSSD1306 converts a row-major mono bitmap into a 768-byte SSD1306 page-order
+// frame, placing the icon's top-left corner at (leftPad, topPad). Each byte = one
+// column of 8 vertical pixels; bit 0 = topmost pixel of that page row.
+func packSSD1306(mono []bool, leftPad, topPad int) []byte {
 	wire := make([]byte, WireBytes)
 
 	for page := 0; page < wirePages; page++ {
 		for col := 0; col < wireWidth; col++ {
-			iconCol := col - iconLeftPad
+			iconCol := col - leftPad
 			if iconCol < 0 || iconCol >= IconWidth {
 				continue
 			}
 			var b byte
 			for bit := 0; bit < 8; bit++ {
-				row := page*8 + bit
-				if row < IconHeight && mono[row*IconWidth+iconCol] {
+				row := page*8 + bit - topPad
+				if row >= 0 && row < IconHeight && mono[row*IconWidth+iconCol] {
 					b |= 1 << uint(bit)
 				}
 			}

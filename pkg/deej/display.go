@@ -12,6 +12,11 @@ import (
 // The master OLED is firmware-controlled and receives no host commands.
 const numChannels = 5
 
+// cmdRequestIconRedraw is the device->host command SERENITY sends during its
+// channel screensaver tick, asking for the channel's icon to be re-rendered at
+// a new bounce offset. Payload: [channel_idx][x_offset][y_offset].
+const cmdRequestIconRedraw = byte(0x06)
+
 // DisplayManager handles the SERENITY connection handshake and channel display push sequencing.
 type DisplayManager struct {
 	deej   *Deej
@@ -51,6 +56,7 @@ func (dm *DisplayManager) TriggerPush() {
 func (dm *DisplayManager) subscribeToSerialEvents() {
 	connectCh := dm.deej.serial.SubscribeToConnectEvents()
 	beaconCh := dm.deej.serial.SubscribeToBeaconEvents()
+	deviceCmdCh := dm.deej.serial.SubscribeToDeviceCommands()
 
 	go func() {
 		for {
@@ -75,9 +81,64 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 				}
 				dm.pushMasterState(writer)
 				dm.pushAll(writer, true)
+
+			case cmd := <-deviceCmdCh:
+				dm.handleDeviceCommand(cmd)
 			}
 		}
 	}()
+}
+
+// handleDeviceCommand dispatches a binary command received from SERENITY.
+func (dm *DisplayManager) handleDeviceCommand(cmd DeviceCommand) {
+	switch cmd.CmdID {
+	case cmdRequestIconRedraw:
+		dm.handleIconRedrawRequest(cmd.Payload)
+	default:
+		dm.logger.Debugw("Received unhandled device command", "cmdID", cmd.CmdID)
+	}
+}
+
+// handleIconRedrawRequest re-renders a channel's icon at a new bounce offset and
+// pushes it, in response to SERENITY's channel screensaver tick.
+func (dm *DisplayManager) handleIconRedrawRequest(payload []byte) {
+	if len(payload) < 3 {
+		dm.logger.Warnw("Malformed icon redraw request", "payloadLen", len(payload))
+		return
+	}
+	channel, xOffset, yOffset := int(payload[0]), int(payload[1]), int(payload[2])
+	if channel >= numChannels {
+		dm.logger.Warnw("Icon redraw request for out-of-range channel", "channel", channel)
+		return
+	}
+
+	writer := dm.deej.serial.Writer()
+	if writer == nil {
+		dm.logger.Warn("Icon redraw requested but writer is nil")
+		return
+	}
+
+	targets, ok := dm.deej.config.SliderMapping.get(channel + 1)
+	if !ok || len(targets) == 0 || targets[0] == "master" {
+		return
+	}
+	processName := targets[0]
+	iconConversion := dm.deej.config.IconConversion[channel]
+
+	bitmap, err := icon.LoadAt(processName, dm.deej.config.IconDir, iconConversion, xOffset, yOffset)
+	if err != nil {
+		dm.logger.Debugw("No icon for channel during screensaver redraw", "channel", channel, "process", processName, "error", err)
+		return
+	}
+
+	if err := writer.SendChannelIcon(byte(channel), bitmap); err != nil {
+		dm.logger.Warnw("Failed to send screensaver icon redraw", "channel", channel, "error", err)
+		return
+	}
+
+	// Off-center bytes won't match a future centered Load() result, so the next
+	// manual/connect push correctly notices the mismatch and re-centers.
+	dm.lastSentIcons[channel] = bitmap
 }
 
 // pushMasterState sends the current master volume and mic mute state, so SERENITY

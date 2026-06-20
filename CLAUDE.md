@@ -150,7 +150,7 @@ Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual 
 
 **Pending:** `handleReport` in `hid.go` currently triggers mute on any received report. Once the firmware HID descriptor is finalized, add a report format check there.
 
-### ✓ 6. Master State Sync on Connect — COMPLETE (pending hardware verification)
+### ✓ 6. Master State Sync on Connect — master volume HARDWARE-VERIFIED; mic mute pending
 
 Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-coded to 512 on power-on because it has no way to know the host's actual current state.
 
@@ -158,7 +158,13 @@ Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-
 - Master volume source: `sessionMap.getMasterVolume()` reads the `"master"` session's `GetVolume()` (0.0–1.0 scalar), converted to raw `0–1023` (`uint16(vol*1023 + 0.5)`) to match the firmware's native domain
 - Mic mute source: `HIDManager.IsMicMuted()` → `MicMuter.IsMuted()` (Windows: `IAudioEndpointVolume.GetMute` on the default capture endpoint; Linux: `pactl get-source-mute @DEFAULT_SOURCE@`)
 - If the master session or mic state isn't available (e.g. session map not yet populated), the corresponding push is skipped rather than guessed
-- **Firmware side implemented** — `processCmd` in `main.cpp` now handles `0x04` (assigns `masterVol`, forces a bar redraw) and `0x05` (assigns `masterMuted`, forces an icon redraw + `applyRgbToHardware()`). Not yet bench-tested against real hardware.
+- **Firmware side** — `processCmd` in `main.cpp` handles `0x04` (assigns `masterVol`, forces a bar redraw) and `0x05` (assigns `masterMuted`, forces an icon redraw + `applyRgbToHardware()`).
+- **Master volume: hardware-verified 2026-06-19.** Required a host-side bug fix (see below) in addition to the firmware handler — the firmware side alone was not sufficient.
+- **Mic mute: still pending hardware verification** — no test method established yet for toggling/observing Windows system mic mute during a bench session.
+
+**Bug found and fixed (2026-06-19):** `serial.go`'s `handleLine` primes `currentSliderPercentValues` to `-1.0` whenever the detected slider count changes, which is "significantly different" from anything and forces a `SliderMoveEvent` on the next read for every slider — including slider 0 (`slider_mapping: 0: master`). `session_map.go` then unconditionally calls `SetVolume()` for that event, which overwrote the real Windows master volume with whatever `masterVol` the firmware happened to boot with (hardcoded 512), racing against and clobbering `pushMasterState`'s sync-down value. Unlike faders 1–5 (a physical position that *should* snap app volumes on connect), slider 0 has no physical position — it's the encoder's last state, which is meaningless before the host has told it anything. Fix: slider 0's first reading after a slider-count change is now primed silently (baseline recorded in `currentSliderPercentValues[0]`, no move event emitted); faders 1–5 keep the original priming behavior.
+
+**Known limitation — sync is connect-only, not live.** `pushMasterState` only fires once, in the beacon handler right after connecting. It does not track master volume changes made externally (Windows volume mixer, keyboard media keys, another app) while SERENITY stays connected — the OLED will not follow those. See "Live Master Volume Tracking" in Remaining Work.
 
 ---
 
@@ -196,6 +202,12 @@ pkg/deej/
 ---
 
 ## Remaining Work
+
+### Live Master Volume Tracking While Connected
+
+**Original request — dropped during initial sync implementation, needs to be added.** `pushMasterState` (see Feature 6) only pushes `SET_MASTER_VOLUME` once, at connect. It needs to also detect master volume changes that happen *while SERENITY is already connected* (Windows volume mixer, media keys, another app changing it) and push the new value down so the OLED stays in sync — not just at connect time.
+
+**Where this likely plugs in:** `sessionMap` already holds the `"master"` session; this would need either (a) a poll loop comparing `getMasterVolume()` against the last-pushed value on some interval, or (b) hooking `IAudioEndpointVolume`'s `RegisterControlChangeNotify` (WASAPI callback on volume change) for a push-based approach on Windows, with a polling fallback for Linux. Must avoid fighting the encoder's own write path — when the *user* turns the encoder, the firmware-originated value should win, not get immediately overwritten by this new external-change detector reacting to the same change.
 
 ### HID Report Validation
 

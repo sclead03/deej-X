@@ -421,16 +421,25 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		// check if it changes the desired state (could just be a jumpy raw slider value)
 		if util.SignificantlyDifferent(sio.currentSliderPercentValues[sliderIdx], normalizedScalar, sio.deej.config.NoiseReductionLevel) {
 
+			// slider 0 is SERENITY's master volume encoder, not a physical-position slider -
+			// its value on the very first read is just whatever masterVol the firmware booted
+			// with, not a real user-set position. Applying it would stomp the actual Windows
+			// volume right as pushMasterState is trying to sync the real value down. Prime the
+			// baseline silently here and let the encoder/pushMasterState drive it from now on.
+			primingMasterSlider := sliderIdx == 0 && sio.currentSliderPercentValues[sliderIdx] < 0
+
 			// if it does, update the saved value and create a move event
 			sio.currentSliderPercentValues[sliderIdx] = normalizedScalar
 
-			moveEvents = append(moveEvents, SliderMoveEvent{
-				SliderID:     sliderIdx,
-				PercentValue: normalizedScalar,
-			})
+			if !primingMasterSlider {
+				moveEvents = append(moveEvents, SliderMoveEvent{
+					SliderID:     sliderIdx,
+					PercentValue: normalizedScalar,
+				})
 
-			if sio.deej.Verbose() {
-				logger.Debugw("Slider moved", "event", moveEvents[len(moveEvents)-1])
+				if sio.deej.Verbose() {
+					logger.Debugw("Slider moved", "event", moveEvents[len(moveEvents)-1])
+				}
 			}
 		}
 	}

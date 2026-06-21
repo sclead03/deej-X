@@ -14,7 +14,23 @@ type paSessionFinder struct {
 
 	client *proto.Client
 	conn   net.Conn
+
+	// pushes live master sink volume changes (see MasterVolumeWatcher)
+	masterVolumeChanges chan float32
 }
+
+// PulseAudio native protocol subscription mask/event bits (pulse/def.h). The
+// proto wrapper library doesn't define these as constants, so they're spelled
+// out here.
+const (
+	paSubscriptionMaskSink = 0x0001
+
+	paSubscriptionEventFacilityMask = 0x000f
+	paSubscriptionEventSink         = 0x0000
+
+	paSubscriptionEventTypeMask = 0x0030
+	paSubscriptionEventChange   = 0x0010
+)
 
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	client, conn, err := proto.Connect("")
@@ -35,15 +51,72 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	}
 
 	sf := &paSessionFinder{
-		logger:        logger.Named("session_finder"),
-		sessionLogger: logger.Named("sessions"),
-		client:        client,
-		conn:          conn,
+		logger:              logger.Named("session_finder"),
+		sessionLogger:       logger.Named("sessions"),
+		client:              client,
+		conn:                conn,
+		masterVolumeChanges: make(chan float32, 8),
+	}
+
+	// live-track external changes to the master sink volume (another app,
+	// pavucontrol, etc.) via PulseAudio's native event subscription - best
+	// effort: a failure here just means the OLED won't live-sync.
+	client.Callback = sf.handlePulseEvent
+	if err := client.Request(&proto.Subscribe{Mask: paSubscriptionMaskSink}, nil); err != nil {
+		sf.logger.Warnw("Failed to subscribe to PulseAudio sink events", "error", err)
 	}
 
 	sf.logger.Debug("Created PA session finder instance")
 
 	return sf, nil
+}
+
+// SubscribeToMasterVolumeChanges implements MasterVolumeWatcher.
+func (sf *paSessionFinder) SubscribeToMasterVolumeChanges() <-chan float32 {
+	return sf.masterVolumeChanges
+}
+
+// handlePulseEvent is proto.Client's Callback, invoked on the client's readLoop
+// goroutine for every unsolicited server message, including our sink-change
+// subscription. It must never issue a synchronous client.Request itself (that
+// would deadlock readLoop waiting on its own reply), so the actual volume
+// re-read happens on a spawned goroutine.
+func (sf *paSessionFinder) handlePulseEvent(msg interface{}) {
+	event, ok := msg.(*proto.SubscribeEvent)
+	if !ok {
+		return
+	}
+
+	if event.Event&paSubscriptionEventFacilityMask != paSubscriptionEventSink {
+		return
+	}
+
+	if event.Event&paSubscriptionEventTypeMask != paSubscriptionEventChange {
+		return
+	}
+
+	go sf.forwardMasterSinkVolume()
+}
+
+// forwardMasterSinkVolume re-reads the current default sink's volume and pushes
+// it to subscribers. Triggered only by a genuine PulseAudio sink-change event -
+// never polled.
+func (sf *paSessionFinder) forwardMasterSinkVolume() {
+	request := proto.GetSinkInfo{SinkIndex: proto.Undefined}
+	reply := proto.GetSinkInfoReply{}
+
+	if err := sf.client.Request(&request, &reply); err != nil {
+		sf.logger.Debugw("Failed to read master sink volume after subscribe event", "error", err)
+		return
+	}
+
+	vol := parseChannelVolumes(reply.ChannelVolumes)
+
+	select {
+	case sf.masterVolumeChanges <- vol:
+	default:
+		sf.logger.Debug("Dropped master volume change notification, consumer not keeping up")
+	}
 }
 
 func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {

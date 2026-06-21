@@ -6,6 +6,7 @@
 - **TBD items are blockers.** Several protocol details are explicitly deferred (icon format, icon dimensions, bitmap bit order, HID report format). Do not guess or assume values for these — check the TBD section first and ask the user if a decision is needed before proceeding.
 - **Windows is the primary target.** Linux is best-effort secondary. All features must work on Windows. Linux implementations follow the same OS-abstraction pattern already established in the codebase.
 - **This is a personal fork, not an upstream PR.** Do not attempt to maintain compatibility with the vanilla deej serial protocol or configuration format beyond what is documented here.
+- **Investigate build/vet errors before calling them pre-existing or unrelated.** See "Build & Verification Gotchas" below — it documents real, root-caused issues (and how to actually verify the Linux build via WSL) found by digging in, not by waving errors away.
 
 ---
 
@@ -164,7 +165,12 @@ Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-
 
 **Bug found and fixed (2026-06-19):** `serial.go`'s `handleLine` primes `currentSliderPercentValues` to `-1.0` whenever the detected slider count changes, which is "significantly different" from anything and forces a `SliderMoveEvent` on the next read for every slider — including slider 0 (`slider_mapping: 0: master`). `session_map.go` then unconditionally calls `SetVolume()` for that event, which overwrote the real Windows master volume with whatever `masterVol` the firmware happened to boot with (hardcoded 512), racing against and clobbering `pushMasterState`'s sync-down value. Unlike faders 1–5 (a physical position that *should* snap app volumes on connect), slider 0 has no physical position — it's the encoder's last state, which is meaningless before the host has told it anything. Fix: slider 0's first reading after a slider-count change is now primed silently (baseline recorded in `currentSliderPercentValues[0]`, no move event emitted); faders 1–5 keep the original priming behavior.
 
-**Known limitation — sync is connect-only, not live.** `pushMasterState` only fires once, in the beacon handler right after connecting. It does not track master volume changes made externally (Windows volume mixer, keyboard media keys, another app) while SERENITY stays connected — the OLED will not follow those. See "Live Master Volume Tracking" in Remaining Work.
+**Live tracking while connected — implemented 2026-06-20, pending hardware verification.** In addition to the connect-time sync above, `sessionMap` now watches for *external* master volume changes (Windows volume mixer, media keys, another app) while SERENITY stays connected, and pushes them down via the same `SET_MASTER_VOLUME` command. This is push-based, not polled, on both platforms:
+- **Windows:** a hand-rolled `IAudioEndpointVolumeCallback` COM object is registered via `IAudioEndpointVolume.RegisterControlChangeNotify` (go-wca's own wrapper for this call is stubbed to `E_NOTIMPL`, so `session_finder_windows.go` calls the real vtable slot directly via `syscall.Syscall` — see `registerMasterVolumeChangeCallback`/`masterVolumeNotifyCallback`). The callback fires synchronously on the audio engine's own thread for every master volume/mute change and is filtered by comparing `guidEventContext` against deej's own `eventCtx` GUID, so deej's own writes (the SERENITY encoder) are recognized precisely, not just by a time heuristic.
+- **Linux:** `session_finder_linux.go` subscribes to PulseAudio's native event mechanism (`proto.Subscribe{Mask: paSubscriptionMaskSink}` + `client.Callback`), re-reading the default sink's volume only when a real sink-change event arrives.
+- Both implementations satisfy a shared `MasterVolumeWatcher` interface (`session_finder.go`); `sessionMap.setupMasterVolumeWatcher` forwards changes to `DisplayManager` only if they weren't just caused by deej itself (`sessionMap.markMasterVolumeSetByDeej`/`masterVolumeRecentlySetByDeej`, a 500ms window — the Linux watcher has no per-event context to compare against, so it relies on this generic backstop; Windows uses both the precise GUID check and this backstop).
+- **Do not implement this as a polling loop.** A prior attempt used a `time.Ticker` polling `getMasterVolume()` every 250ms; this was explicitly rejected as an unacceptable approach for a never-ending host-resident loop. The push-based mechanisms above were built specifically to avoid that.
+- Not yet exercised against real hardware — needs a bench test confirming the OLED follows a Windows-side volume change while SERENITY stays connected.
 
 ---
 
@@ -201,13 +207,38 @@ pkg/deej/
 
 ---
 
+## Build & Verification Gotchas
+
+Real, root-caused issues found while verifying builds/vet on this machine. Check here before calling an error "pre-existing" or "unrelated" — that determination must be backed by actual investigation, not assumed.
+
+### Cross-compiling `GOOS=linux` from this Windows box will always fail — expected, not a bug
+
+`go build`/`go vet` with `GOOS=linux` run from this Windows host fails with `undefined: nativeLoop` (and similar) inside `github.com/getlantern/systray`. Cause: `systray_linux.go` uses `import "C"` (cgo: GTK3 + libappindicator + webkit2gtk), and cross-compiling from Windows defaults `CGO_ENABLED=0`, so that file is silently skipped while `systray.go` still calls the functions it defines. **This is not a defect in this project's code** and isn't fixable by editing our Go files — don't strip the tray dependency or add build tags to "fix" it. To get a real answer about the Linux build, build it natively (see below) instead of cross-compiling.
+
+### Verifying the Linux build for real: use WSL
+
+This machine has WSL (Ubuntu 24.04) installed, with a real Go toolchain, gcc, and the GTK3/appindicator/webkit2gtk dev headers `systray` needs for its native cgo build (`golang-go`, `build-essential`, `pkg-config`, `libgtk-3-dev`, `libappindicator3-dev`, `libwebkit2gtk-4.1-dev` — installed 2026-06-20). Use it instead of cross-compiling or declaring Linux "unverifiable from here":
+
+```
+wsl -d Ubuntu -- bash -lc "cd '/mnt/c/Users/Steven/Documents/Solid Models/deej/Deej-X/Deej-X' && PKG_CONFIG_PATH=\$HOME/pkgconfig-shim go build ./... 2>&1"
+wsl -d Ubuntu -- bash -lc "cd '/mnt/c/Users/Steven/Documents/Solid Models/deej/Deej-X/Deej-X' && PKG_CONFIG_PATH=\$HOME/pkgconfig-shim go vet ./... 2>&1"
+```
+
+- Ubuntu 24.04 only ships `webkit2gtk-4.1`, but the pinned 2020-era `systray` version hardcodes a `webkit2gtk-4.0` pkg-config lookup. Fixed with a no-sudo shim at `~/pkgconfig-shim/webkit2gtk-4.0.pc` *inside WSL* that redirects to the installed 4.1 package — always pass `PKG_CONFIG_PATH=$HOME/pkgconfig-shim` on build/vet commands there.
+- Installing/removing apt packages needs `sudo`, which requires an interactive password Claude doesn't have. Ask the user to run the `apt-get install` command themselves (the `!` prefix, or a one-line `wsl -d Ubuntu -- sudo ...` for a separate cmd/PowerShell window) rather than attempting to bypass this.
+- A harmless linker warning (`missing .note.GNU-stack section implies executable stack`) is normal on this cgo build and not a real issue.
+
+### `signal.Notify` with an unbuffered channel — fixed 2026-06-20
+
+`pkg/deej/util/util.go`'s `SetupCloseHandler` used to create an **unbuffered** `chan os.Signal` passed to `signal.Notify`. `signal.Notify` does a non-blocking send to registered channels, so an unbuffered channel can silently drop the OS interrupt signal if nothing happens to be receiving at that exact instant. Fixed by buffering the channel (`make(chan os.Signal, 1)`). If `go vet` flags this pattern again elsewhere, apply the same fix — don't dismiss it as a pre-existing warning without checking.
+
+### `go vet`'s `unsafeptr` check on Win32/COM callback structs
+
+When writing a hand-rolled COM callback (mirroring the `IMMNotificationClient` pattern already in `session_finder_windows.go`), declare pointer-typed callback parameters as their real pointer type (e.g. `pNotify *audioVolumeNotificationData`), **not** `uintptr` plus a manual `unsafe.Pointer(uintptr)` cast inside the function body. `syscall.NewCallback` marshals typed pointer arguments directly — see the existing `this *wca.IMMNotificationClient` parameter on `defaultDeviceChangedCallback`. Converting a `uintptr` to `unsafe.Pointer` after the fact is exactly the pattern `go vet`'s `unsafeptr` check flags (fabricating a pointer from an arbitrary integer), even though it happens to be safe in practice here (the memory belongs to the OS/COM caller, not the Go GC). Use the typed-parameter form so vet stays clean instead of suppressing or excusing the warning.
+
+---
+
 ## Remaining Work
-
-### Live Master Volume Tracking While Connected
-
-**Original request — dropped during initial sync implementation, needs to be added.** `pushMasterState` (see Feature 6) only pushes `SET_MASTER_VOLUME` once, at connect. It needs to also detect master volume changes that happen *while SERENITY is already connected* (Windows volume mixer, media keys, another app changing it) and push the new value down so the OLED stays in sync — not just at connect time.
-
-**Where this likely plugs in:** `sessionMap` already holds the `"master"` session; this would need either (a) a poll loop comparing `getMasterVolume()` against the last-pushed value on some interval, or (b) hooking `IAudioEndpointVolume`'s `RegisterControlChangeNotify` (WASAPI callback on volume change) for a push-based approach on Windows, with a polling fallback for Linux. Must avoid fighting the encoder's own write path — when the *user* turns the encoder, the firmware-originated value should win, not get immediately overwritten by this new external-change detector reacting to the same change.
 
 ### HID Report Validation
 

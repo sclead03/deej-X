@@ -23,7 +23,21 @@ type sessionMap struct {
 
 	lastSessionRefresh time.Time
 	unmappedSessions   []Session
+
+	// lastMasterWriteFromDeej records when deej itself last wrote the master
+	// session's volume (currently: only the SERENITY encoder, via a slider move
+	// event targeting "master"). Used to keep the live master volume watcher
+	// from echoing the encoder's own change back down to the firmware as if it
+	// were an external (e.g. Windows volume mixer) change.
+	lastMasterWriteFromDeej time.Time
+
+	masterVolumeChangeConsumers []chan float32
 }
+
+// masterVolumeEchoSuppressWindow is how long after deej itself last wrote the
+// master volume that a further observed change is assumed to be an echo of
+// that same write, rather than a genuinely external change.
+const masterVolumeEchoSuppressWindow = 500 * time.Millisecond
 
 const (
 	masterSessionName = "master" // master device volume
@@ -81,6 +95,10 @@ func (m *sessionMap) initialize() error {
 
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
+
+	if watcher, ok := m.sessionFinder.(MasterVolumeWatcher); ok {
+		m.setupMasterVolumeWatcher(watcher)
+	}
 
 	return nil
 }
@@ -147,6 +165,35 @@ func (m *sessionMap) setupOnSliderMove() {
 			}
 		}
 	}()
+}
+
+// setupMasterVolumeWatcher forwards live, externally-sourced master volume
+// changes (Windows volume mixer, media keys, another app) from the platform's
+// push-based watcher to our own subscribers, filtering out deej's own writes
+// (the SERENITY encoder) so they aren't echoed back down to the firmware.
+func (m *sessionMap) setupMasterVolumeWatcher(watcher MasterVolumeWatcher) {
+	changes := watcher.SubscribeToMasterVolumeChanges()
+
+	go func() {
+		for vol := range changes {
+			if m.masterVolumeRecentlySetByDeej(masterVolumeEchoSuppressWindow) {
+				continue
+			}
+
+			for _, consumer := range m.masterVolumeChangeConsumers {
+				consumer <- vol
+			}
+		}
+	}()
+}
+
+// SubscribeToMasterVolumeChanges returns a channel that receives the master
+// volume scalar whenever it changes externally (not via deej's own writes).
+// Nothing is ever sent if the current platform has no MasterVolumeWatcher.
+func (m *sessionMap) SubscribeToMasterVolumeChanges() chan float32 {
+	ch := make(chan float32)
+	m.masterVolumeChangeConsumers = append(m.masterVolumeChangeConsumers, ch)
+	return ch
 }
 
 // performance: explain why force == true at every such use to avoid unintended forced refresh spams
@@ -251,6 +298,8 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 					if err := session.SetVolume(event.PercentValue); err != nil {
 						m.logger.Warnw("Failed to set target session volume", "error", err)
 						adjustmentFailed = true
+					} else if resolvedTarget == masterSessionName {
+						m.markMasterVolumeSetByDeej()
 					}
 				}
 			}
@@ -354,6 +403,24 @@ func (m *sessionMap) getMasterVolume() (float32, bool) {
 	}
 
 	return sessions[0].GetVolume(), true
+}
+
+// markMasterVolumeSetByDeej records that deej itself just wrote the master
+// session's volume (see lastMasterWriteFromDeej).
+func (m *sessionMap) markMasterVolumeSetByDeej() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.lastMasterWriteFromDeej = time.Now()
+}
+
+// masterVolumeRecentlySetByDeej reports whether deej itself wrote the master
+// session's volume within the given window.
+func (m *sessionMap) masterVolumeRecentlySetByDeej(window time.Duration) bool {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	return time.Since(m.lastMasterWriteFromDeej) < window
 }
 
 func (m *sessionMap) clear() {

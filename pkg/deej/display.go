@@ -6,6 +6,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sclead03/deej-x/pkg/deej/icon"
+	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
 // numChannels is the number of channel OLEDs on SERENITY (indices 0–4, mapped to faders 1–5).
@@ -25,6 +26,11 @@ type DisplayManager struct {
 	// last successfully sent state per channel; used to skip unchanged channels on manual push
 	lastSentNames [numChannels]string
 	lastSentIcons [numChannels][]byte
+
+	// last master volume scalar successfully pushed to SERENITY; used to dedupe
+	// redundant pushes triggered by the live master volume watcher.
+	lastPushedMasterVolume float32
+	havePushedMasterVolume bool
 }
 
 // NewDisplayManager creates a DisplayManager and wires it to SerialIO connection and beacon events.
@@ -57,6 +63,7 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 	connectCh := dm.deej.serial.SubscribeToConnectEvents()
 	beaconCh := dm.deej.serial.SubscribeToBeaconEvents()
 	deviceCmdCh := dm.deej.serial.SubscribeToDeviceCommands()
+	masterVolCh := dm.deej.sessions.SubscribeToMasterVolumeChanges()
 
 	go func() {
 		for {
@@ -84,9 +91,38 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 
 			case cmd := <-deviceCmdCh:
 				dm.handleDeviceCommand(cmd)
+
+			case vol := <-masterVolCh:
+				dm.handleExternalMasterVolumeChange(vol)
 			}
 		}
 	}()
+}
+
+// handleExternalMasterVolumeChange pushes a master volume change down to SERENITY
+// in response to a live, externally-sourced change (Windows volume mixer, media
+// keys, another app) reported by the platform's MasterVolumeWatcher. Pushes the
+// encoder itself caused are already filtered out before reaching this point -
+// see sessionMap.setupMasterVolumeWatcher.
+func (dm *DisplayManager) handleExternalMasterVolumeChange(vol float32) {
+	writer := dm.deej.serial.Writer()
+	if writer == nil {
+		return
+	}
+
+	if dm.havePushedMasterVolume && !util.SignificantlyDifferent(dm.lastPushedMasterVolume, vol, dm.deej.config.NoiseReductionLevel) {
+		return
+	}
+
+	raw := uint16(vol*1023 + 0.5)
+	if err := writer.SendMasterVolume(raw); err != nil {
+		dm.logger.Warnw("Failed to send live master volume update", "error", err)
+		return
+	}
+
+	dm.lastPushedMasterVolume = vol
+	dm.havePushedMasterVolume = true
+	dm.logger.Debugw("Pushed live master volume update", "raw", raw)
 }
 
 // handleDeviceCommand dispatches a binary command received from SERENITY.
@@ -150,6 +186,8 @@ func (dm *DisplayManager) pushMasterState(writer *SerialWriter) {
 			dm.logger.Warnw("Failed to send master volume", "error", err)
 		} else {
 			dm.logger.Debugw("Sent master volume", "raw", raw)
+			dm.lastPushedMasterVolume = vol
+			dm.havePushedMasterVolume = true
 		}
 	} else {
 		dm.logger.Debug("Master session not available, skipping master volume push")

@@ -27,6 +27,12 @@ type wcaSessionFinder struct {
 	// our master input and output sessions
 	masterOut *masterSession
 	masterIn  *masterSession
+
+	// pushes live master output volume changes (see MasterVolumeWatcher);
+	// aevCallback is built once and re-registered against each new masterOut's
+	// IAudioEndpointVolume as it's (re)created in GetAllSessions
+	masterVolumeChanges chan float32
+	aevCallback         *iAudioEndpointVolumeCallback
 }
 
 const (
@@ -44,14 +50,20 @@ const (
 
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	sf := &wcaSessionFinder{
-		logger:        logger.Named("session_finder"),
-		sessionLogger: logger.Named("sessions"),
-		eventCtx:      ole.NewGUID(myteriousGUID),
+		logger:              logger.Named("session_finder"),
+		sessionLogger:       logger.Named("sessions"),
+		eventCtx:            ole.NewGUID(myteriousGUID),
+		masterVolumeChanges: make(chan float32, 8),
 	}
 
 	sf.logger.Debug("Created WCA session finder instance")
 
 	return sf, nil
+}
+
+// SubscribeToMasterVolumeChanges implements MasterVolumeWatcher.
+func (sf *wcaSessionFinder) SubscribeToMasterVolumeChanges() <-chan float32 {
+	return sf.masterVolumeChanges
 }
 
 func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
@@ -125,6 +137,13 @@ func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 	}
 
 	sessions = append(sessions, sf.masterOut)
+
+	// live-track external changes to the master output volume (Windows volume
+	// mixer, media keys, another app). best-effort: a failure here just means
+	// the OLED won't live-sync, so it's logged but not fatal.
+	if err := sf.registerMasterVolumeChangeCallback(); err != nil {
+		sf.logger.Warnw("Failed to register master volume change callback", "error", err)
+	}
 
 	// get the master input session, if a default input device exists
 	if defaultInputEndpoint != nil {
@@ -537,5 +556,105 @@ func (sf *wcaSessionFinder) defaultDeviceChangedCallback(
 	return
 }
 func (sf *wcaSessionFinder) noopCallback() (hResult uintptr) {
+	return
+}
+
+// iAudioEndpointVolumeCallback and its vtable are hand-rolled because go-wca only
+// defines the interface's IID (wca.IID_IAudioEndpointVolumeCallback), not the
+// struct/vtable types - mirrors the IMMNotificationClient pattern above. Likewise,
+// go-wca's own IAudioEndpointVolume.RegisterControlChangeNotify wrapper is stubbed
+// to E_NOTIMPL even on Windows (the real vtable slot is there, just unwired), so
+// registerMasterVolumeChangeCallback below calls that slot directly via syscall,
+// same as every aev* helper in the go-wca package itself does for other AEV methods.
+type iAudioEndpointVolumeCallback struct {
+	VTable *iAudioEndpointVolumeCallbackVtbl
+}
+
+type iAudioEndpointVolumeCallbackVtbl struct {
+	QueryInterface uintptr
+	AddRef         uintptr
+	Release        uintptr
+	OnNotify       uintptr
+}
+
+// audioVolumeNotificationData mirrors the fixed-size prefix of Win32's
+// AUDIO_VOLUME_NOTIFICATION_DATA; the trailing per-channel volume array is unused
+// here and omitted.
+type audioVolumeNotificationData struct {
+	GuidEventContext ole.GUID
+	BMuted           int32
+	FMasterVolume    float32
+	NChannels        uint32
+}
+
+// registerMasterVolumeChangeCallback (re)registers our IAudioEndpointVolumeCallback
+// against the current sf.masterOut's IAudioEndpointVolume. Safe to call repeatedly
+// across session refreshes - the callback object is built once and reused; there's
+// no UnregisterControlChangeNotify call on the old endpoint because go-wca stubs
+// that too, but it's moot since releasing the old IAudioEndpointVolume (handled
+// elsewhere via masterSession.Release) drops the registration along with it -
+// the same reasoning already applied to mmNotificationClient in Release() below.
+func (sf *wcaSessionFinder) registerMasterVolumeChangeCallback() error {
+	if sf.masterOut == nil {
+		return errors.New("no master output session to register against")
+	}
+
+	if sf.aevCallback == nil {
+		sf.aevCallback = &iAudioEndpointVolumeCallback{
+			VTable: &iAudioEndpointVolumeCallbackVtbl{
+				QueryInterface: syscall.NewCallback(sf.noopCallback),
+				AddRef:         syscall.NewCallback(sf.noopCallback),
+				Release:        syscall.NewCallback(sf.noopCallback),
+				OnNotify:       syscall.NewCallback(sf.masterVolumeNotifyCallback),
+			},
+		}
+	}
+
+	aev := sf.masterOut.volume
+
+	hr, _, _ := syscall.Syscall(
+		aev.VTable().RegisterControlChangeNotify,
+		2,
+		uintptr(unsafe.Pointer(aev)),
+		uintptr(unsafe.Pointer(sf.aevCallback)),
+		0)
+	if hr != 0 {
+		return ole.NewError(hr)
+	}
+
+	return nil
+}
+
+// masterVolumeNotifyCallback is invoked by the Windows audio engine (on its own
+// thread) whenever the registered endpoint's volume or mute state changes -
+// whether caused by deej itself or externally (Windows volume mixer, media keys,
+// another app). It only reads plain memory and does a non-blocking channel send,
+// so it's safe to run without CoInitializeEx and without blocking the audio engine.
+//
+// pNotify is declared as a typed pointer (not uintptr) so syscall.NewCallback
+// marshals it directly - same approach already used for "this" in
+// defaultDeviceChangedCallback above. Declaring it uintptr and converting via
+// unsafe.Pointer would trip go vet's unsafeptr check (fabricating a pointer from
+// an arbitrary integer), since vet can't know this uintptr is actually a valid
+// pointer handed to us by the COM callback ABI.
+func (sf *wcaSessionFinder) masterVolumeNotifyCallback(this uintptr, pNotify *audioVolumeNotificationData) (hResult uintptr) {
+	if pNotify == nil {
+		return
+	}
+
+	// deej's own writes (currently: only the SERENITY encoder, via SetVolume with
+	// this exact context) are filtered here precisely; sessionMap also applies a
+	// time-window filter as a platform-agnostic backstop for watchers that can't
+	// distinguish by context (e.g. the Linux PulseAudio watcher).
+	if pNotify.GuidEventContext == *sf.eventCtx {
+		return
+	}
+
+	select {
+	case sf.masterVolumeChanges <- pNotify.FMasterVolume:
+	default:
+		sf.logger.Debug("Dropped master volume change notification, consumer not keeping up")
+	}
+
 	return
 }

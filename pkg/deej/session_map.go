@@ -1,6 +1,7 @@
 package deej
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -584,6 +585,45 @@ func (m *sessionMap) getMasterMuted() (bool, bool) {
 	}
 
 	return muted, true
+}
+
+// toggleMasterMuted flips the master output session's real WASAPI mute state
+// and returns the resulting value. Used by SERENITY's encoder mute button
+// (CMD_REQUEST_MASTER_MUTE_TOGGLE, see display.go's
+// handleMasterMuteToggleRequest) - mirrors windowsMicMuter.ToggleMute, but
+// goes through masterSession.SetMuted's eventCtx-tagged SetMute call so the
+// resulting notification is filtered out by GUID at the source
+// (session_finder_windows.go's masterVolumeNotifyCallback) rather than relying
+// only on the time-window backstop mic mute needs.
+func (m *sessionMap) toggleMasterMuted() (bool, error) {
+	sessions, ok := m.get(masterSessionName)
+	if !ok || len(sessions) == 0 {
+		return false, errors.New("master session not available")
+	}
+
+	type muteToggler interface {
+		GetMuted() (bool, error)
+		SetMuted(bool) error
+	}
+
+	mt, ok := sessions[0].(muteToggler)
+	if !ok {
+		return false, errors.New("master session does not support mute toggling")
+	}
+
+	muted, err := mt.GetMuted()
+	if err != nil {
+		return false, fmt.Errorf("get current master mute state: %w", err)
+	}
+
+	nowMuted := !muted
+	if err := mt.SetMuted(nowMuted); err != nil {
+		return false, fmt.Errorf("set master mute state: %w", err)
+	}
+
+	m.markMasterVolumeSetByDeej()
+
+	return nowMuted, nil
 }
 
 // markMasterVolumeSetByDeej records that deej itself just wrote the master

@@ -184,9 +184,8 @@ func (s *masterSession) SetVolume(v float32) error {
 }
 
 // GetMuted reports the master output session's real WASAPI mute state
-// (BMuted) - distinct from SERENITY's own local zero-spoof "volMuted" concept,
-// which has no host-side representation of its own (see pushMasterState).
-// Used via the optional muteGetter interface in sessionMap.getMasterMuted.
+// (BMuted). Used via the optional muteGetter/muteToggler interfaces in
+// sessionMap.getMasterMuted/toggleMasterMuted.
 func (s *masterSession) GetMuted() (bool, error) {
 	var muted bool
 	if err := s.volume.GetMute(&muted); err != nil {
@@ -195,6 +194,21 @@ func (s *masterSession) GetMuted() (bool, error) {
 	}
 
 	return muted, nil
+}
+
+// SetMuted sets the master output session's real WASAPI mute state, tagged
+// with the same eventCtx GUID as SetVolume so masterVolumeNotifyCallback can
+// filter the resulting notification out as deej's own write (see
+// sessionMap.toggleMasterMuted) - unlike the capture endpoint's mic mute,
+// which can't pass a real eventCtx without crashing (see hid_windows.go's
+// ToggleMute), this endpoint already does so safely via SetVolume above.
+func (s *masterSession) SetMuted(muted bool) error {
+	if err := s.volume.SetMute(muted, s.eventCtx); err != nil {
+		s.logger.Warnw("Failed to set session mute state", "error", err, "muted", muted)
+		return fmt.Errorf("set session mute state: %w", err)
+	}
+
+	return nil
 }
 
 func (s *masterSession) Release() {

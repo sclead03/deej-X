@@ -20,7 +20,7 @@ const (
 	cmdSetChIcon       = byte(0x03)
 	cmdSetMasterVol    = byte(0x04)
 	cmdSetMicMuteState = byte(0x05)
-	cmdSetMasterMute   = byte(0x07) // 0x06 is reserved device->host (CMD_REQUEST_ICON_REDRAW, see display.go)
+	cmdSetMasterMute   = byte(0x07) // 0x06 and 0x08 are reserved device->host (CMD_REQUEST_ICON_REDRAW, CMD_REQUEST_MASTER_MUTE_TOGGLE - see display.go)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.

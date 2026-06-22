@@ -18,6 +18,11 @@ const numChannels = 5
 // a new bounce offset. Payload: [channel_idx][x_offset][y_offset].
 const cmdRequestIconRedraw = byte(0x06)
 
+// cmdRequestMasterMuteToggle is the device->host command SERENITY's encoder
+// sends on a confirmed single-click, asking the host to perform a real
+// OS-level master mute toggle. No payload - see handleMasterMuteToggleRequest.
+const cmdRequestMasterMuteToggle = byte(0x08)
+
 // DisplayManager handles the SERENITY connection handshake and channel display push sequencing.
 type DisplayManager struct {
 	deej   *Deej
@@ -177,9 +182,42 @@ func (dm *DisplayManager) handleDeviceCommand(cmd DeviceCommand) {
 	switch cmd.CmdID {
 	case cmdRequestIconRedraw:
 		dm.handleIconRedrawRequest(cmd.Payload)
+	case cmdRequestMasterMuteToggle:
+		dm.handleMasterMuteToggleRequest()
 	default:
 		dm.logger.Debugw("Received unhandled device command", "cmdID", cmd.CmdID)
 	}
+}
+
+// handleMasterMuteToggleRequest performs the real OS-level master mute toggle
+// requested by SERENITY's encoder click and pushes the result back down
+// directly - the same "act now, push the result myself" pattern HIDManager
+// uses for the RGB button's mic mute, rather than waiting on the generic
+// external-change watcher. That watcher will also observe this same change,
+// but drops it as deej's own write (see sessionMap.toggleMasterMuted), so it
+// won't push a redundant/racing second copy of the same state.
+func (dm *DisplayManager) handleMasterMuteToggleRequest() {
+	writer := dm.deej.serial.Writer()
+	if writer == nil {
+		dm.logger.Warn("Master mute toggle requested but writer is nil")
+		return
+	}
+
+	nowMuted, err := dm.deej.sessions.toggleMasterMuted()
+	if err != nil {
+		dm.logger.Warnw("Failed to toggle master mute", "error", err)
+		return
+	}
+
+	if err := writer.SendMasterMuteState(nowMuted); err != nil {
+		dm.logger.Warnw("Failed to push master mute toggle result", "error", err)
+		return
+	}
+
+	dm.lastPushedVolMuted = nowMuted
+	dm.havePushedVolMuted = true
+
+	dm.logger.Debugw("Toggled master mute via SERENITY encoder", "muted", nowMuted)
 }
 
 // handleIconRedrawRequest re-renders a channel's icon at a new bounce offset and

@@ -286,6 +286,16 @@ When writing a hand-rolled COM callback (mirroring the `IMMNotificationClient` p
 
 ## Remaining Work
 
+### NEXT PRIORITY — Master volume mute broken/inconsistent, reported 2026-06-21 — NOT YET INVESTIGATED
+
+Reported right after the master+mic mute live-sync work above shipped; very likely a regression from it, but **not yet investigated or fixed — do not start until explicitly told to.** Symptoms as described (exact repro not yet pinned down):
+- Hardware-initiated mute (SERENITY's encoder click) no longer functions at all while deej-X is connected.
+- Host-initiated mute (external Windows-side mute, pushed via `SET_MASTER_MUTE_STATE`) correctly zeros the volume, but unmute clears the mute icon/flag on SERENITY while leaving the volume at 0 instead of restoring it.
+
+Most likely place to look first, once investigation starts: the interaction between firmware's local `volMuted` zero-spoof (which also drives the regular fader/ASCII output) and the new `SET_MASTER_MUTE_STATE` push touching that same flag — see firmware CLAUDE.md's matching TODO entry for the firmware-side half of this.
+
+**Open design question to revisit as part of this, not a fix to make right now:** why is master mute "zero the transmitted serial value" (firmware-local, round-trips through the regular slider-move path) instead of a real WASAPI mute (`IAudioEndpointVolume.SetMute`/`GetMute` on the master output endpoint — the same mechanism mic mute already uses)? The zero-spoof approach is the suspected source of this bug class; real WASAPI mute would preserve the underlying volume level independent of the mute flag, which seems more robust. Worth reconsidering the whole approach instead of just patching this specific symptom.
+
 ### Global Mic Mute (mute all inputs, unmute one) — NOT DESIGNED IN DETAIL, discussion only (2026-06-21)
 
 Today's mic mute (`windowsMicMuter`, Feature 4 above) only ever touches **the OS default capture device** — `withCaptureVolume` calls `GetDefaultAudioEndpoint(ECapture, EConsole, ...)`, a single device, every time. There's no per-device targeting for mic mute at all today (the friendly-name device targeting that exists for `slider_mapping` is a volume-only mechanism, unrelated).

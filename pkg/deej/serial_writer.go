@@ -61,15 +61,34 @@ func (sw *SerialWriter) SendQuery() error {
 	return sw.send(cmdQuery, nil)
 }
 
+// channelNameToLatin1 converts a UTF-8 string to single-byte ISO-8859-1 (Latin-1)
+// bytes. SERENITY's compiled-in font tables are keyed by single-byte Latin-1
+// codes (e.g. 'é' = 0xE9), not UTF-8 (which encodes 'é' as the two bytes 0xC3
+// 0xA9) - sending raw UTF-8 bytes means the firmware looks up two nonexistent
+// glyphs instead of one real one. Runes outside Latin-1's range (most non-Western
+// scripts) fall back to '?', since the firmware's fonts can't render them anyway.
+func channelNameToLatin1(name string) []byte {
+	out := make([]byte, 0, len(name))
+	for _, r := range name {
+		if r <= 0xFF {
+			out = append(out, byte(r))
+		} else {
+			out = append(out, '?')
+		}
+	}
+	return out
+}
+
 // SendChannelName pushes a display name for channel idx (0–4).
 // Names longer than MaxChannelNameLength are silently truncated.
 func (sw *SerialWriter) SendChannelName(idx byte, name string) error {
-	if len(name) > MaxChannelNameLength {
-		name = name[:MaxChannelNameLength]
+	latin1 := channelNameToLatin1(name)
+	if len(latin1) > MaxChannelNameLength {
+		latin1 = latin1[:MaxChannelNameLength]
 	}
-	payload := make([]byte, 0, 1+len(name)+1)
+	payload := make([]byte, 0, 1+len(latin1)+1)
 	payload = append(payload, idx)
-	payload = append(payload, name...)
+	payload = append(payload, latin1...)
 	payload = append(payload, 0x00)
 	return sw.send(cmdSetChName, payload)
 }

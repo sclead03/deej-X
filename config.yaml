@@ -32,8 +32,8 @@ icon_conversion:
 channel_names:
   - Firefox
   - Spotify
-  - Discord
-  - Unmapped
+  - é ü ö ä ñ
+  - É Ü Ö Ä Ñ
   - System
 
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)

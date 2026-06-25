@@ -10,8 +10,8 @@ slider_mapping:
   0: master
   1: firefox.exe
   2: spotify.exe
-  3: discord.exe
-  4: deej.unmapped
+  3: deej.unmapped
+  4: vlc
   5: system
 
 # directory containing PNG icon files for channel OLEDs; relative to deej-x.exe or absolute
@@ -23,17 +23,19 @@ icon_dir: icons
 # Dithering softens anti-aliased edges; threshold gives a hard binary cutoff.
 icon_conversion:
   - threshold
-  - dithering
-  - dithering
+  - threshold
+  - threshold
   - threshold
   - threshold
 
 # display names for SERENITY channel OLEDs (indices 0-4, corresponding to faders 1-5)
+# Accented characters supported: é, É, ü, Ü, ö, Ö, ä, Ä, ñ, Ñ
+# 15-character limit
 channel_names:
   - Firefox
   - Spotify
-  - é ü ö ä ñ
-  - É Ü Ö Ä Ñ
+  - Unmapped
+  - éÉ üÜ öÖ äÄ ñÑ
   - System
 
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)

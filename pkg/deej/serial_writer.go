@@ -20,7 +20,9 @@ const (
 	cmdSetChIcon       = byte(0x03)
 	cmdSetMasterVol    = byte(0x04)
 	cmdSetMicMuteState = byte(0x05)
-	cmdSetMasterMute   = byte(0x07) // 0x06 and 0x08 are reserved device->host (CMD_REQUEST_ICON_REDRAW, CMD_REQUEST_MASTER_MUTE_TOGGLE - see display.go)
+	cmdSetMasterMute     = byte(0x07) // 0x06 and 0x08 are reserved device->host (CMD_REQUEST_ICON_REDRAW, CMD_REQUEST_MASTER_MUTE_TOGGLE - see display.go)
+	cmdSetGestureConfig  = byte(0x09) // 0x0A is reserved device->host (CMD_REQUEST_MIC_MUTE_ACTION - see display.go)
+	cmdSetClickWindow    = byte(0x0B)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -155,6 +157,21 @@ func (sw *SerialWriter) SendMasterMuteState(muted bool) error {
 		payload[0] = 0x01
 	}
 	return sw.send(cmdSetMasterMute, payload)
+}
+
+// SendClickWindow pushes the encoder button click-window duration (ms, uint16 LE).
+// Firmware adds its own 40ms debounce headroom on top of this value internally.
+func (sw *SerialWriter) SendClickWindow(ms uint16) error {
+	payload := make([]byte, 2)
+	binary.LittleEndian.PutUint16(payload, ms)
+	return sw.send(cmdSetClickWindow, payload)
+}
+
+// SendGestureConfig pushes the encoder button gesture → action mapping to SERENITY.
+// Each argument is one of the GestureAction* constants from config.go (0=MasterMute,
+// 1=PlayPause, 2=SkipForward, 3=SkipBack).
+func (sw *SerialWriter) SendGestureConfig(single, double, triple byte) error {
+	return sw.send(cmdSetGestureConfig, []byte{single, double, triple})
 }
 
 func (sw *SerialWriter) send(cmdID byte, payload []byte) error {

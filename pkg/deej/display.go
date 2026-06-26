@@ -23,6 +23,11 @@ const cmdRequestIconRedraw = byte(0x06)
 // OS-level master mute toggle. No payload - see handleMasterMuteToggleRequest.
 const cmdRequestMasterMuteToggle = byte(0x08)
 
+// cmdRequestMicMuteAction is the device->host command fired when an encoder
+// gesture is mapped to mic_mute (4) or mic_unmute (5). Payload: [desired_state]
+// where 0x00 = mute, 0x01 = unmute. Requires firmware action IDs 4/5 support.
+const cmdRequestMicMuteAction = byte(0x0A)
+
 // DisplayManager handles the SERENITY connection handshake and channel display push sequencing.
 type DisplayManager struct {
 	deej   *Deej
@@ -59,15 +64,33 @@ func NewDisplayManager(deej *Deej, logger *zap.SugaredLogger) (*DisplayManager, 
 	return dm, nil
 }
 
-// TriggerPush sends all channel names and icons to SERENITY, skipping channels
-// whose state hasn't changed since the last successful push.
+// TriggerPush sends all channel names, icons, and gesture config to SERENITY,
+// skipping unchanged channels.
 func (dm *DisplayManager) TriggerPush() {
 	writer := dm.deej.serial.Writer()
 	if writer == nil {
 		dm.logger.Warn("Push requested but serial is not connected")
 		return
 	}
+	dm.pushEncoderConfig(writer)
 	dm.pushAll(writer, false)
+}
+
+// pushEncoderConfig sends the gesture action mapping and click-window duration from config.
+func (dm *DisplayManager) pushEncoderConfig(writer *SerialWriter) {
+	g := dm.deej.config.Gestures
+	if err := writer.SendGestureConfig(g.SingleClick, g.DoubleClick, g.TripleClick); err != nil {
+		dm.logger.Warnw("Failed to send gesture config", "error", err)
+	} else {
+		dm.logger.Debugw("Sent gesture config", "single", g.SingleClick, "double", g.DoubleClick, "triple", g.TripleClick)
+	}
+
+	ms := uint16(dm.deej.config.EncoderClickWindowMs)
+	if err := writer.SendClickWindow(ms); err != nil {
+		dm.logger.Warnw("Failed to send click window", "error", err)
+	} else {
+		dm.logger.Debugw("Sent click window", "ms", ms)
+	}
 }
 
 func (dm *DisplayManager) subscribeToSerialEvents() {
@@ -189,6 +212,8 @@ func (dm *DisplayManager) handleDeviceCommand(cmd DeviceCommand) {
 		dm.handleIconRedrawRequest(cmd.Payload)
 	case cmdRequestMasterMuteToggle:
 		dm.handleMasterMuteToggleRequest()
+	case cmdRequestMicMuteAction:
+		dm.handleMicMuteActionRequest(cmd.Payload)
 	default:
 		dm.logger.Debugw("Received unhandled device command", "cmdID", cmd.CmdID)
 	}
@@ -223,6 +248,21 @@ func (dm *DisplayManager) handleMasterMuteToggleRequest() {
 	dm.havePushedVolMuted = true
 
 	dm.logger.Debugw("Toggled master mute via SERENITY encoder", "muted", nowMuted)
+}
+
+// handleMicMuteActionRequest applies a forced mic mute or unmute requested by an
+// encoder gesture (action IDs mic_mute=4 / mic_unmute=5). Payload byte 0x00 =
+// mute, 0x01 = unmute. Delegates to HIDManager.applyMicMuteAction so the same
+// mute_action / unmute_action config targets and state tracking apply as for
+// the RGB button.
+func (dm *DisplayManager) handleMicMuteActionRequest(payload []byte) {
+	if len(payload) < 1 {
+		dm.logger.Warnw("Malformed mic mute action request", "payloadLen", len(payload))
+		return
+	}
+	muted := payload[0] == 0x00
+	dm.deej.hid.applyMicMuteAction(muted)
+	dm.logger.Debugw("Applied mic mute action from encoder gesture", "muted", muted)
 }
 
 // handleIconRedrawRequest re-renders a channel's icon at a new bounce offset and
@@ -266,9 +306,10 @@ func (dm *DisplayManager) handleIconRedrawRequest(payload []byte) {
 	dm.lastSentIcons[channel] = bitmap
 }
 
-// pushMasterState sends the current master volume and mic mute state, so SERENITY
-// can sync its encoder/display/RGB state instead of booting to hard-coded defaults.
+// pushMasterState sends the current master volume, mic mute state, and gesture config,
+// so SERENITY can sync its state instead of booting to hard-coded defaults.
 func (dm *DisplayManager) pushMasterState(writer *SerialWriter) {
+	dm.pushEncoderConfig(writer)
 	if vol, ok := dm.deej.sessions.getMasterVolume(); ok {
 		raw := uint16(vol*1023 + 0.5)
 		if err := writer.SendMasterVolume(raw); err != nil {

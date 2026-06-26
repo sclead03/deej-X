@@ -79,6 +79,8 @@ All host → firmware commands use binary framing:
 | `SET_MASTER_VOLUME` | `0x04` | `[vol_lo][vol_hi]` | Raw 0–1023, same domain as firmware's own `masterVol`; host's current master volume on connect |
 | `SET_MIC_MUTE_STATE` | `0x05` | `[muted]` | `0x00` unmuted / `0x01` muted; host's current system mic mute state on connect, plus live updates (RGB button and external Windows changes) |
 | `SET_MASTER_MUTE_STATE` | `0x07` | `[muted]` | `0x00` unmuted / `0x01` muted; master output's real WASAPI mute state. Pushed on connect, live on external changes (volume mixer mute button, media keys), and as the authoritative reply to SERENITY's own `CMD_REQUEST_MASTER_MUTE_TOGGLE` (see firmware→host table below and "Master volume mute redesign" further down) |
+| `SET_GESTURE_CONFIG` | `0x09` | `[single][double][triple]` | Encoder gesture → action mapping; action IDs: 0=MasterVolMute 1=PlayPause 2=SkipForward 3=SkipBack 4=MicMute 5=MicUnmute. Pushed on every beacon and manual push. |
+| `SET_CLICK_WINDOW` | `0x0B` | `[ms_lo][ms_hi]` | Encoder click-window duration, uint16 LE, milliseconds. Firmware adds 40ms debounce headroom internally. Default 250 ms; host enforces range 50–1000 ms. Pushed on every beacon and manual push. |
 
 Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on connect and exposed via `SerialIO.Writer()`.
 
@@ -88,8 +90,9 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 |---|---|---|---|
 | `CMD_REQUEST_ICON_REDRAW` | `0x06` | `[channel_idx][x_offset][y_offset]` | Firmware's channel screensaver tick asking the host to re-render and re-stream that channel's icon at a new bounce position, instead of centered |
 | `CMD_REQUEST_MASTER_MUTE_TOGGLE` | `0x08` | none | Firmware's encoder, on a confirmed single-click, asking the host to perform a real OS-level master mute toggle — see "Master volume mute redesign" below |
+| `CMD_REQUEST_MIC_MUTE_ACTION` | `0x0A` | `[desired_state]` | Fired when a gesture mapped to MicMute (4) or MicUnmute (5) fires. `0x00` = mute, `0x01` = unmute. Not yet implemented in firmware — see "Remaining Work". |
 
-CMD_IDs `0x06` and `0x08` are unassigned in the host→firmware direction, so there's no ambiguity, but note the two directions are independent namespaces anyway — they're parsed by entirely separate programs/state machines sharing only the physical UART. Read by `SerialIO.readFrames()` in `serial.go` (the binary-frame branch of the byte-stream parser that also produces fader-data lines), dispatched via `SerialIO.SubscribeToDeviceCommands()`, handled in `display.go`'s `handleIconRedrawRequest` / `handleMasterMuteToggleRequest`.
+CMD_IDs `0x06`, `0x08`, and `0x0A` are unassigned in the host→firmware direction; `0x09` and `0x0B` are unassigned in the firmware→host direction. The two directions are independent namespaces — they're parsed by entirely separate programs/state machines sharing only the physical UART. Read by `SerialIO.readFrames()` in `serial.go` (the binary-frame branch of the byte-stream parser that also produces fader-data lines), dispatched via `SerialIO.SubscribeToDeviceCommands()`, handled in `display.go`'s `handleIconRedrawRequest` / `handleMasterMuteToggleRequest` / `handleMicMuteActionRequest`.
 
 ### ✓ 2. Connection Handshake and Push Trigger — COMPLETE
 

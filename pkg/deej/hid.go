@@ -166,6 +166,42 @@ func (h *HIDManager) readLoop(r io.ReadCloser) {
 	}
 }
 
+// applyMicMuteAction force-mutes or unmutes per the configured mute_action /
+// unmute_action targets, updates tracked state, and pushes the new state to
+// SERENITY. Called from handleReport (RGB button) and display.go's
+// handleMicMuteActionRequest (encoder gesture 0x0A).
+func (h *HIDManager) applyMicMuteAction(muted bool) {
+	// Mark before applying: SetMute's COM notification can fire synchronously
+	// on this call stack before MuteDevices/UnmuteDevices returns, so the
+	// suppression window must already be open (see session_map.go).
+	h.deej.sessions.markMicMuteSetByButton()
+
+	cfg := h.deej.config.MicMute
+	var err error
+	if muted {
+		err = h.muter.MuteDevices(cfg.MuteAction)
+	} else {
+		err = h.muter.UnmuteDevices(cfg.UnmuteAction)
+	}
+	if err != nil {
+		h.logger.Warnw("Failed to apply mic mute action", "muting", muted, "error", err)
+		return
+	}
+
+	h.currentMuted = muted
+	h.currentMutedKnown = true
+
+	writer := h.deej.serial.Writer()
+	if writer == nil {
+		return
+	}
+	if err := writer.SendMicMuteState(muted); err != nil {
+		h.logger.Warnw("Failed to push mic mute state", "error", err)
+		return
+	}
+	h.logger.Debugw("Pushed mic mute state", "muted", muted)
+}
+
 func (h *HIDManager) handleReport(report []byte) {
 	if len(report) == 0 || report[0] != micMuteReportID {
 		h.logger.Debugw("Ignoring HID report not for mic mute", "report", report)
@@ -174,45 +210,22 @@ func (h *HIDManager) handleReport(report []byte) {
 
 	h.logger.Debug("Received mic-mute HID report")
 
-	// If we haven't observed a button press or external change yet, read the
-	// real default-device state so we toggle in the right direction.
-	if !h.currentMutedKnown {
-		if muted, err := h.muter.IsMuted(); err == nil {
-			h.currentMuted = muted
+	switch h.deej.config.RGBButtonAction {
+	case "mute_mic":
+		h.applyMicMuteAction(true)
+	case "unmute_mic":
+		h.applyMicMuteAction(false)
+	case "masterVol_mute":
+		h.deej.display.handleMasterMuteToggleRequest()
+	default: // "mic_mute_toggle"
+		// Toggle from the last known state; query the OS if we haven't seen a
+		// change yet so we start in the right direction.
+		if !h.currentMutedKnown {
+			if muted, err := h.muter.IsMuted(); err == nil {
+				h.currentMuted = muted
+			}
+			h.currentMutedKnown = true
 		}
-		h.currentMutedKnown = true
+		h.applyMicMuteAction(!h.currentMuted)
 	}
-
-	newMuted := !h.currentMuted
-
-	// Mark before applying: SetMute's COM notification can fire synchronously
-	// on this call stack before MuteDevices/UnmuteDevices returns, so the
-	// suppression window must already be open (see session_map.go).
-	h.deej.sessions.markMicMuteSetByButton()
-
-	cfg := h.deej.config.MicMute
-	var err error
-	if newMuted {
-		err = h.muter.MuteDevices(cfg.MuteAction)
-	} else {
-		err = h.muter.UnmuteDevices(cfg.UnmuteAction)
-	}
-	if err != nil {
-		h.logger.Warnw("Failed to apply mic mute action", "muting", newMuted, "error", err)
-		return
-	}
-
-	h.currentMuted = newMuted
-	h.currentMutedKnown = true
-
-	writer := h.deej.serial.Writer()
-	if writer == nil {
-		return
-	}
-	if err := writer.SendMicMuteState(newMuted); err != nil {
-		h.logger.Warnw("Failed to push mic mute state after button action", "error", err)
-		return
-	}
-
-	h.logger.Debugw("Pushed mic mute state after button action", "muted", newMuted)
 }

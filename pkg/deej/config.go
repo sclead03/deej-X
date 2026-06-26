@@ -14,6 +14,36 @@ import (
 	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
+// Encoder button gesture action IDs (firmware SET_GESTURE_CONFIG payload values).
+// Actions 0–3 are executed by the firmware directly (0 triggers CMD_REQUEST_MASTER_MUTE_TOGGLE
+// back to host; 1–3 are sent as Consumer Control HID reports). Actions 4–5 require
+// firmware support for a new CMD_REQUEST_MIC_MUTE_ACTION (0x0A) device→host command —
+// see display.go. Firmware must be updated to use action IDs 4–5.
+const (
+	GestureActionMasterMute  byte = 0
+	GestureActionPlayPause   byte = 1
+	GestureActionSkipForward byte = 2
+	GestureActionSkipBack    byte = 3
+	GestureActionMicMute     byte = 4
+	GestureActionMicUnmute   byte = 5
+)
+
+var gestureActionByName = map[string]byte{
+	"masterVol_mute": GestureActionMasterMute,
+	"play_pause":   GestureActionPlayPause,
+	"skip_forward": GestureActionSkipForward,
+	"skip_back":    GestureActionSkipBack,
+	"mute_mic":   GestureActionMicMute,
+	"unmute_mic": GestureActionMicUnmute,
+}
+
+// GestureConfig maps each encoder button gesture to a firmware action ID.
+type GestureConfig struct {
+	SingleClick byte
+	DoubleClick byte
+	TripleClick byte
+}
+
 // MicMuteConfig specifies which capture devices are affected by mute/unmute button presses.
 // Targets are case-insensitive friendly-name substrings (e.g. "Razer Microphone") or the
 // sentinels micMuteSentinelAll ("mute.all") / micUnmuteSentinelAll ("unmute.all").
@@ -38,7 +68,10 @@ type CanonicalConfig struct {
 	MasterLabel         string
 	ChannelNames        [numChannels]string
 	IconDir             string
-	MicMute             MicMuteConfig
+	MicMute               MicMuteConfig
+	Gestures              GestureConfig
+	RGBButtonAction       string
+	EncoderClickWindowMs  int
 
 	logger             *zap.SugaredLogger
 	notifier           Notifier
@@ -69,8 +102,21 @@ const (
 	configKeyFaderOrder        = "fader_order"
 	configKeyChannelNames      = "channel_names"
 	configKeyIconDir           = "icon_dir"
-	configKeyMicMuteMuteAction = "mic_mute.mute_action"
-	configKeyMicMuteUnmuteAct  = "mic_mute.unmute_action"
+	configKeyMicMuteMuteAction     = "mic_mute.mute_action"
+	configKeyMicMuteUnmuteAct      = "mic_mute.unmute_action"
+	configKeyGestureSingleClick    = "encoder_gestures.single_click"
+	configKeyGestureDoubleClick    = "encoder_gestures.double_click"
+	configKeyGestureTripleClick    = "encoder_gestures.triple_click"
+	configKeyEncoderClickWindow    = "encoder_click_window_ms"
+	configKeyRGBButtonAction       = "rgb_button.action"
+
+	defaultEncoderClickWindowMs = 250
+	minEncoderClickWindowMs     = 50
+	maxEncoderClickWindowMs     = 1000
+
+	// rgbButtonActionDefault is the default RGB button action — toggle mic mute,
+	// preserving the original hardcoded behaviour.
+	rgbButtonActionDefault = "mic_mute_toggle"
 
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 115200
@@ -308,9 +354,49 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		cc.MicMute.UnmuteAction = []string{micUnmuteSentinelAll}
 	}
 
+	cc.Gestures.SingleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureSingleClick), GestureActionMasterMute, cc.logger)
+	cc.Gestures.DoubleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureDoubleClick), GestureActionPlayPause, cc.logger)
+	cc.Gestures.TripleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureTripleClick), GestureActionSkipForward, cc.logger)
+
+	clickWindow := cc.userConfig.GetInt(configKeyEncoderClickWindow)
+	if clickWindow == 0 {
+		clickWindow = defaultEncoderClickWindowMs
+	} else if clickWindow < minEncoderClickWindowMs || clickWindow > maxEncoderClickWindowMs {
+		cc.logger.Warnw("encoder_click_window_ms out of range, using default",
+			"value", clickWindow,
+			"min", minEncoderClickWindowMs,
+			"max", maxEncoderClickWindowMs,
+			"default", defaultEncoderClickWindowMs)
+		clickWindow = defaultEncoderClickWindowMs
+	}
+	cc.EncoderClickWindowMs = clickWindow
+
+	action := strings.ToLower(strings.TrimSpace(cc.userConfig.GetString(configKeyRGBButtonAction)))
+	if action == "" {
+		action = rgbButtonActionDefault
+	}
+	switch action {
+	case "mic_mute_toggle", "mute_mic", "unmute_mic", "masterVol_mute":
+		cc.RGBButtonAction = action
+	default:
+		cc.logger.Warnw("Unknown rgb_button action, using default", "action", action)
+		cc.RGBButtonAction = rgbButtonActionDefault
+	}
+
 	cc.logger.Debug("Populated config fields from vipers")
 
 	return nil
+}
+
+func parseGestureAction(name string, defaultAction byte, logger *zap.SugaredLogger) byte {
+	if name == "" {
+		return defaultAction
+	}
+	if action, ok := gestureActionByName[strings.ToLower(name)]; ok {
+		return action
+	}
+	logger.Warnw("Unknown gesture action, using default", "name", name)
+	return defaultAction
 }
 
 func (cc *CanonicalConfig) onConfigReloaded() {

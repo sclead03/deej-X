@@ -17,7 +17,7 @@ Fork of [omriharel/deej](https://github.com/omriharel/deej) (MIT license), a Go 
 
 **Module path:** `github.com/sclead03/deej-x`
 
-This fork is customized exclusively for the **SERENITY** hardware: a custom ATmega32U4-based audio mixer with 5 faders, 5 mute buttons/LEDs, a rotary encoder, an RGB LED button, and 6 SSD1306 OLED displays. The original deej host app works with SERENITY as-is for basic fader control; this fork adds bidirectional communication, OLED icon/name streaming, and system mic mute via HID.
+This fork is customized exclusively for the **SERENITY** hardware: a custom ATmega32U4-based audio mixer with 5 faders, 5 mute buttons/LEDs, a rotary encoder, an RGB LED button, and 6 SSD1306 OLED displays. This fork adds bidirectional communication, OLED icon/name streaming, and system mic mute via HID.
 
 ---
 
@@ -51,13 +51,13 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `slider_mapping` | ✓ existing | 6-channel SERENITY layout in default config |
 | `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
 | `icon_dir` | ✓ implemented | Directory containing PNG icon files; relative or absolute path |
-| `icon_conversion` | ✓ implemented | Per-channel list: `"dither"` (Floyd-Steinberg) or `"threshold"`; scalar value applies to all channels |
+| `icon_conversion` | pending removal | See "Remove Dithering Support" in Remaining Work |
 
 ---
 
-## Feature Status
+## Protocol & Architecture
 
-### ✓ 1. Bidirectional Serial Protocol — COMPLETE
+### Bidirectional Serial
 
 All host → firmware commands use binary framing:
 
@@ -69,145 +69,93 @@ All host → firmware commands use binary framing:
 - `LEN` is payload length in bytes, little-endian 16-bit
 - **Fire-and-forget** — no ACK, no retry; USB CDC serial reliability is sufficient
 
-**Assigned CMD_IDs (host → firmware):**
+Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on connect and exposed via `SerialIO.Writer()`. Received frames are parsed by `SerialIO.readFrames()` in `serial.go`, dispatched via `SerialIO.SubscribeToDeviceCommands()`, handled in `display.go`.
+
+**Host → firmware CMD_IDs:**
 
 | Name | CMD_ID | Payload | Description |
 |---|---|---|---|
-| `CMD_QUERY` | `0x01` | none | Host → firmware: request ready beacon |
+| `CMD_QUERY` | `0x01` | none | Request ready beacon |
 | `SET_CHANNEL_NAME` | `0x02` | `[channel_idx][name\0]` | Push display name for channel N |
 | `SET_CHANNEL_ICON` | `0x03` | `[channel_idx][bitmap bytes]` | Push icon bitmap for channel N |
-| `SET_MASTER_VOLUME` | `0x04` | `[vol_lo][vol_hi]` | Raw 0–1023, same domain as firmware's own `masterVol`; host's current master volume on connect |
-| `SET_MIC_MUTE_STATE` | `0x05` | `[muted]` | `0x00` unmuted / `0x01` muted; host's current system mic mute state on connect, plus live updates (RGB button and external Windows changes) |
-| `SET_MASTER_MUTE_STATE` | `0x07` | `[muted]` | `0x00` unmuted / `0x01` muted; master output's real WASAPI mute state. Pushed on connect, live on external changes (volume mixer mute button, media keys), and as the authoritative reply to SERENITY's own `CMD_REQUEST_MASTER_MUTE_TOGGLE` (see firmware→host table below and "Master volume mute redesign" further down) |
-| `SET_GESTURE_CONFIG` | `0x09` | `[single][double][triple]` | Encoder gesture → action mapping; action IDs: 0=MasterVolMute 1=PlayPause 2=SkipForward 3=SkipBack 4=MicMute 5=MicUnmute. Pushed on every beacon and manual push. |
-| `SET_CLICK_WINDOW` | `0x0B` | `[ms_lo][ms_hi]` | Encoder click-window duration, uint16 LE, milliseconds. Firmware adds 40ms debounce headroom internally. Default 250 ms; host enforces range 50–1000 ms. Pushed on every beacon and manual push. |
+| `SET_MASTER_VOLUME` | `0x04` | `[vol_lo][vol_hi]` | Raw 0–1023; host's current master volume |
+| `SET_MIC_MUTE_STATE` | `0x05` | `[muted]` | `0x00` unmuted / `0x01` muted |
+| `SET_MASTER_MUTE_STATE` | `0x07` | `[muted]` | `0x00` unmuted / `0x01` muted; master output WASAPI mute state |
+| `SET_GESTURE_CONFIG` | `0x09` | `[single][double][triple]` | Encoder gesture → action mapping; action IDs: 0=MasterVolMute 1=PlayPause 2=SkipForward 3=SkipBack 4=MicMute 5=MicUnmute. Pushed on every beacon. |
+| `SET_CLICK_WINDOW` | `0x0B` | `[ms_lo][ms_hi]` | Encoder click-window duration, uint16 LE, ms. Default 250; host enforces 50–1000. Pushed on every beacon. |
 
-Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on connect and exposed via `SerialIO.Writer()`.
-
-**Assigned CMD_IDs (firmware → host):**
+**Firmware → host CMD_IDs:**
 
 | Name | CMD_ID | Payload | Description |
 |---|---|---|---|
-| `CMD_REQUEST_ICON_REDRAW` | `0x06` | `[channel_idx][x_offset][y_offset]` | Firmware's channel screensaver tick asking the host to re-render and re-stream that channel's icon at a new bounce position, instead of centered |
-| `CMD_REQUEST_MASTER_MUTE_TOGGLE` | `0x08` | none | Firmware's encoder, on a confirmed single-click, asking the host to perform a real OS-level master mute toggle — see "Master volume mute redesign" below |
-| `CMD_REQUEST_MIC_MUTE_ACTION` | `0x0A` | `[desired_state]` | Fired when a gesture mapped to MicMute (4) or MicUnmute (5) fires. `0x00` = mute, `0x01` = unmute. Not yet implemented in firmware — see "Remaining Work". |
+| `CMD_REQUEST_ICON_REDRAW` | `0x06` | `[channel_idx][x_offset][y_offset]` | Screensaver: re-render icon at bounce offset instead of centered |
+| `CMD_REQUEST_MASTER_MUTE_TOGGLE` | `0x08` | none | Encoder single-click: perform OS-level master mute toggle |
+| `CMD_REQUEST_MIC_MUTE_ACTION` | `0x0A` | `[desired_state]` | Gesture-mapped mic mute/unmute. `0x00`=mute, `0x01`=unmute. Not yet implemented in firmware. |
 
-CMD_IDs `0x06`, `0x08`, and `0x0A` are unassigned in the host→firmware direction; `0x09` and `0x0B` are unassigned in the firmware→host direction. The two directions are independent namespaces — they're parsed by entirely separate programs/state machines sharing only the physical UART. Read by `SerialIO.readFrames()` in `serial.go` (the binary-frame branch of the byte-stream parser that also produces fader-data lines), dispatched via `SerialIO.SubscribeToDeviceCommands()`, handled in `display.go`'s `handleIconRedrawRequest` / `handleMasterMuteToggleRequest` / `handleMicMuteActionRequest`.
+The two directions are independent namespaces. CMD_IDs `0x06`, `0x08`, `0x0A` are unassigned host→firmware; `0x09`, `0x0B` are unassigned firmware→host.
 
-### ✓ 2. Connection Handshake and Push Trigger — COMPLETE
+### Connection & Push
 
-Both connection scenarios are handled:
+- **Hotplug (device arrives while host running):** `hotplug_windows.go` — WM_DEVICECHANGE/DBT_DEVICEARRIVAL via message-only window and RegisterDeviceNotificationW (GUID_DEVINTERFACE_COMPORT). 500ms settle delay, then open port.
+- **Host launches with device connected:** connect event → CMD_QUERY immediately.
+- **Reconnect:** readFrames goroutine closes channel on read error → Start() detects → close() → reconnect() goroutine → waitForSerialDevice() → retry Start().
+- **On beacon (`SERENITY\r\n`):** pushMasterState → pushAll.
+- **Manual trigger:** "Push display icons" tray item → display.TriggerPush(), skipping unchanged channels.
+- **Change tracking:** DisplayManager tracks lastSentNames and lastSentIcons per channel. Connection events force-push all; manual pushes skip unchanged.
 
-**Device connects while host is already running:**
-- `hotplug_windows.go` registers a `WM_DEVICECHANGE` / `DBT_DEVICEARRIVAL` listener via a message-only window and `RegisterDeviceNotificationW` (GUID_DEVINTERFACE_COMPORT)
-- On arrival, waits 500ms for the CDC driver to settle, then opens the serial port
-- Connect event fires → `CMD_QUERY` sent → `SERENITY\r\n` beacon → push triggered
+### Channel Names
 
-**Host launches with device already connected:**
-- `display.go` receives the connect event, sends `CMD_QUERY` immediately
-- Firmware responds with `SERENITY\r\n`
-- Beacon received → push triggered
+Pushed via SET_CHANNEL_NAME on every connection and manual push. Source: `channel_names` in config.yaml → `CanonicalConfig.ChannelNames [5]string`. `MaxChannelNameLength = 15` (serial_writer.go). Config reload picks up changes on next push.
 
-**Device unplugged and replugged while host is running:**
-- `readFrames` goroutine closes its channel on read error
-- `Start()` goroutine detects closed channel → calls `close()` → spawns `reconnect()` goroutine
-- `reconnect()` calls `waitForSerialDevice()` (same hotplug path) then retries `Start()`
+### Channel Icons
 
-**Manual trigger:** "Push display icons" tray menu item calls `display.TriggerPush()`, skipping unchanged channels.
+Pushed via SET_CHANNEL_ICON on connection and manual push. Source: PNG files in `icon_dir`, named after the process with `.exe` stripped. `deej.unmapped` → `unmapped.png`; `system` → `system.png`; master slot skipped.
 
-**Host-side change detection:** `DisplayManager` tracks `lastSentNames` and `lastSentIcons` per channel. Connection events force-push all channels; manual pushes skip unchanged ones.
+Pipeline (transparent PNG): box-filter resize alpha to 36×36 → use alpha as content mask → threshold.
+Pipeline (opaque PNG): box-filter resize RGB to 36×36 → grayscale → threshold → 1-bit.
+Output: 768-byte SSD1306 page-order frame; 36×36 icon at given offset (46px horizontal / 6px vertical padding when centered).
 
-Implemented in `display.go`, `serial.go`, and `hotplug_windows.go`.
+Implemented in `pkg/deej/icon/channel_icon.go`: `loadMono()`, `packSSD1306(mono, leftPad, topPad)`, `Load()` (centered), `LoadAt()` (arbitrary offset for screensaver bounce). Missing icons logged at debug level and skipped gracefully. `lastSentIcons` tracks change state; screensaver redraws update it so a later centered push correctly detects the position changed.
 
-### ✓ 3. Channel Name Streaming — COMPLETE
+### HID Mic Mute
 
-Names are pushed via `SET_CHANNEL_NAME` on every connection event and on manual push.
+Device: USB VID `0x1209`, PID `0x0001` (composite: CDC serial + HID).
 
-- Source: `channel_names` list in `config.yaml`, read into `CanonicalConfig.ChannelNames [5]string`
-- `MaxChannelNameLength = 15` (constant in `serial_writer.go`; revisit when firmware font size is finalized)
-- Config reload automatically picks up new names on the next manual push
+- Pure Go, no CGO: Win32 HID via `setupapi.dll`/`hid.dll` using `syscall.NewLazyDLL`
+- Mic-mute report: ID 4, usage page `0xFF00`, usage `1` (`kMicMuteDesc` in firmware)
+- SERENITY's HID interface splits into two Windows device paths (COL01 = Consumer Control/Play-Pause; COL02 = vendor mic-mute). VID/PID substring match alone isn't sufficient — `matchesMicMuteCollection()` opens each match and checks usage via `HidD_GetPreparsedData`/`HidP_GetCaps`, skipping non-matching collections.
+- `handleReport` filters on `report[0] == micMuteReportID`; ignores Play/Pause (report ID 3).
+- After toggle: reads back real state via `IsMuted()` and pushes via `SerialWriter.SendMicMuteState` (SET_MIC_MUTE_STATE/0x05).
+- Linux: `openSERENITY` not yet implemented; HID manager retries silently. Mic mute via `pactl`.
 
-### ✓ 5. Channel Icon Streaming — COMPLETE
+**Rules for `withCaptureVolume` closures in `hid_windows.go` — apply to any new COM closure here:**
+- Never access the receiver (`m`) or captured state inside the closure — only `aev` and plain locals. Move logging/receiver access to after `withCaptureVolume` returns. Violations cause crashes (empirically confirmed across multiple incidents; exact mechanism not fully understood).
+- Always pass `nil` for `SetMute`'s eventContext on the capture endpoint — a real GUID crashes. Self-triggered writes are suppressed via `markMicMuteSetByButton` time window (500ms, `micMuteEchoSuppressWindow`) instead.
+- `markMicMuteSetByButton()` must be called **before** `ToggleMute()` — the WASAPI callback can fire synchronously before ToggleMute returns.
+- `micMuteNotifyCallback`: copy notification by value, spawn goroutine for all actual work. No COM calls or receiver access inline.
 
-Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual push.
+### Master State Sync & Live Tracking
 
-- Source: PNG files in `icon_dir` (config key), named after the process with `.exe` stripped (`chrome.png`, `spotify.png`)
-- `deej.unmapped` maps to `unmapped.png`; `system` maps to `system.png`; `master` slot is skipped
-- Conversion: per-channel, configurable via `icon_conversion` list — `"dither"` (Floyd-Steinberg) or `"threshold"`; a scalar value in config.yaml applies to all channels
-- Pipeline (transparent PNG): detect alpha → box-filter resize alpha channel to 36×36 → use alpha as content mask (transparent=off, opaque=on); apply dither or threshold to alpha values for edge softening
-- Pipeline (opaque PNG): box-filter resize RGB to 36×36 → grayscale → threshold or Floyd-Steinberg dither → 1-bit
-- Output: 768-byte SSD1306 page-order frame; 36×36 icon placed at a given offset within the 128×48 blue area (46px horizontal / 6px vertical padding when centered)
-- Implemented in `pkg/deej/icon/channel_icon.go`: `loadMono()` does decode/resize/dither, `packSSD1306(mono, leftPad, topPad)` packs at an arbitrary offset, `Load()` (centered) and `LoadAt()` (arbitrary offset) are thin wrappers. `Load` is wired into `display.go` `pushAll()`; `LoadAt` is used by `handleIconRedrawRequest` for screensaver bounce repositioning (see Feature 1's `CMD_REQUEST_ICON_REDRAW`).
-- Missing icon files are logged at debug level and skipped gracefully (no crash)
-- `lastSentIcons` change tracking prevents redundant re-sends on manual push; screensaver redraws also update `lastSentIcons` so a later centered push correctly notices the position changed
+On every beacon (before pushAll), `DisplayManager.pushMasterState` sends:
+- `SET_MASTER_VOLUME` (0x04): `getMasterVolume()` × 1023, rounded → uint16 LE
+- `SET_MIC_MUTE_STATE` (0x05): `HIDManager.IsMicMuted()`
+- `SET_MASTER_MUTE_STATE` (0x07): `sessionMap.getMasterMuted()`
 
-### ✓ 4. System Mic Mute via HID — COMPLETE
+Skips any push where the value isn't available (session map not yet populated).
 
-**Device identification:**
-- USB VID: `0x1209`, USB PID: `0x0001`
-- SERENITY enumerates as a composite USB device: CDC serial + HID
+Live master volume/mute changes are tracked via push-based OS callbacks — **do not change this to polling.**
 
-**HID implementation (pure Go, no CGO):**
-- Windows: enumerates HID devices via `setupapi.dll` and `hid.dll` using `syscall.NewLazyDLL` — no C compiler required
-- Device matched by VID/PID string in the device path, opened with `CreateFile`, read with `ReadFile`
-- `MicMuter` interface with `_windows.go` / `_linux.go` implementations
-- Windows mic mute: WASAPI/MMDeviceAPI (`go-wca`, already a dependency) to toggle default recording device mute
-- Linux mic mute: `pactl set-source-mute @DEFAULT_SOURCE@ toggle` (best-effort)
-- Linux HID enumeration: not yet implemented (`openSERENITY` returns an error; HID manager retries silently)
+- **Windows:** `IAudioEndpointVolumeCallback` registered via `registerMasterVolumeChangeCallback` (direct vtable call — go-wca's wrapper is stubbed to E_NOTIMPL). Filtered by `guidEventContext` vs. deej's `eventCtx` GUID. `GetAllSessions()` calls `runtime.LockOSThread()` on entry and never calls `CoUninitialize()` — COM stays initialized for the life of the process.
+- **Linux:** PulseAudio `proto.Subscribe{Mask: paSubscriptionMaskSink}` sink events.
+- Both satisfy `MasterVolumeWatcher` (`session_finder.go`). `SubscribeToMasterVolumeChanges()` returns `<-chan MasterVolumeNotification{Volume, Muted}`. Volume and mute are pushed independently via separate dedupe state — either can change without the other.
+- Channel capacity: capacity-1, latest-value-wins (evict-and-replace) on both the source channel and per-consumer fan-out.
+- Settle: 100ms debounce timer in `setupMasterVolumeWatcher`; on expiry re-reads via `getMasterVolume()` and forwards as `MasterVolumeUpdate{ForceSync: true}`, bypassing noise-threshold dedup.
 
-**Report ID filtering implemented 2026-06-21.** Previously `handleReport` in `hid.go` triggered mute on *any* received report — this was more than a TODO, it was an active bug: the encoder's double-click sends a Consumer Control Play/Pause report (report ID 3, `kConsumerDesc` in `main.cpp`) on the *same shared HID interface*, so every double-click also fired a spurious mute toggle, and reliably crashed deej-x outright (see "Encoder double-click crash" below). Firmware now sends the RGB button's mic-mute signal as its own dedicated report — report ID 4, vendor-defined usage page 0xFF00 (`kMicMuteDesc`/`sendMicMuteButtonReport()` in `main.cpp`) — and `handleReport` checks `report[0] == micMuteReportID` before doing anything, ignoring the Play/Pause report entirely. After a successful toggle, it also reads back the real resulting state via `IsMuted()` and pushes it down with `SerialWriter.SendMicMuteState` (the same `SET_MIC_MUTE_STATE`/`0x05` command already verified for connect-time sync), correcting firmware's optimistic local toggle if it guessed wrong.
+**Slider 0 on connect:** First reading after a slider-count change is silently baselined (no `SliderMoveEvent`) — faders 1–5 still snap to physical position. Slider 0 has no meaningful physical position before the host has synced down the real value.
 
-**Encoder double-click crash — root-caused and fixed 2026-06-21.** Every double-click reliably crashed deej-x with no toast, no dialog, and no crash log. Root cause was two-fold:
-1. The "any report triggers mute" bug above meant the Play/Pause report from double-click was hitting `windowsMicMuter.ToggleMute()` at all, which it was never supposed to.
-2. `ToggleMute`'s COM call chain (`withCaptureVolume` in `hid_windows.go`) runs on `HIDManager`'s read-loop goroutine, which was never pinned with `runtime.LockOSThread()`. Confirmed via a console build (`go run`) that the crash is a Go runtime **`fatal error: fault`** (a corrupted-heap abort that dumps every goroutine, not a normal single-stack `panic:`) — `recover()` cannot catch this class of error by design, which is exactly why `panic.go`'s crash-log/toast mechanism never fired. This is the same structural hazard as the master-volume-callback bug above (hand-rolled `syscall.Syscall`-based COM bindings, unpinned goroutine), just surfacing as heap corruption here instead of a silently-dead callback. Fixed the same way: `withCaptureVolume` now calls `runtime.LockOSThread()`/`defer runtime.UnlockOSThread()` for the duration of each call (unlocked afterward, unlike the master-volume fix, since nothing here needs to outlive the call).
-3. A misleading detail hit while debugging: the original crash's panic-style trace pointed at `m.logger.Debugw(...)` with what looked like a nil/garbage receiver. Verified via temporary diagnostic logging that `m`/`m.logger` are never nil — that frame's printed values were an artifact of the optimized build's stack unwinding, not the real bug. Don't trust argument values in an optimized-build crash trace at face value; the `fatal error: fault` + full goroutine dump was the real signal.
+**Echo suppression (slot 0):** `handleLine` skips `SliderMoveEvent` for slot-0 readings that exactly match `SerialWriter.LastSentMasterVolumeRaw`, or arrive within `masterVolumeSerialEchoWindow` (200ms) of the last SET_MASTER_VOLUME send. The time window (not just exact match) is necessary because multiple pushes can be in flight simultaneously.
 
-**Bench-verified 2026-06-21 after reflash.** Double-click no longer crashes or affects mic mute. Hit two more real bugs surfaced only by hardware testing, both fixed:
-- **Wrong HID collection opened.** Adding the second top-level collection (mic-mute) made Windows split SERENITY's HID interface into two separate device paths (`HID\VID_1209&PID_0001&MI_02&COL01` = Consumer Control, `&COL02` = vendor-defined mic-mute), confirmed via `Get-CimInstance Win32_PnPEntity`. `openSERENITY()` in `hid_windows.go` matched on VID/PID substring alone and returned the *first* match it enumerated (COL01, Play/Pause) — it never reached COL02, so the mic-mute report never arrived at all. Fixed by adding `matchesMicMuteCollection()`, which opens each VID/PID match and checks its actual HID usage via `HidD_GetPreparsedData`/`HidP_GetCaps` (usage page `0xFF00`, usage `1`, matching firmware's `kMicMuteDesc`), skipping non-matching collections instead of returning the first hit.
-- **Second crash, different mechanism, after the fix above.** Once the report reached `ToggleMute()`, the real WASAPI toggle succeeded every time, but the process then crashed immediately after — same call site as the double-click crash (`m.logger.Debugw(...)` inside `ToggleMute`'s closure, right after `aev.SetMute` returned), but this time a clean recoverable `panic: invalid memory address or nil pointer dereference` rather than the earlier `fatal error: fault`. The `runtime.LockOSThread()` fix (added for the double-click crash) did *not* fix this — it kept recurring at the identical line even with that fix in place, which in hindsight means the double-click "fix" likely only worked because report-ID filtering stopped Play/Pause from ever reaching `ToggleMute` again, not because `LockOSThread` actually fixed the underlying issue. The one consistent pattern across every repro: `IsMuted()`'s closure (which only touches the local `aev`/`muted`, never the `m` receiver) never once crashed, while `ToggleMute()`'s closure (which called `m.logger.Debugw(...)`, referencing the receiver, from inside the closure passed across the COM call boundary) crashed every time. Fixed by restructuring `ToggleMute` to only touch `aev` and a plain local inside the closure, moving the `m.logger.Debugw` call to *after* `withCaptureVolume` returns, fully outside the COM/syscall chain. Bench-confirmed clean across ~15 consecutive button presses (mute/unmute both directions) with no crash. The exact mechanism (why touching the receiver from inside a closure spanning a hand-rolled syscall COM call corrupts something) was not fully root-caused — the fix was validated empirically by elimination, not by a confirmed theory. If something similar resurfaces in other hand-rolled COM closures in this codebase (`session_finder_windows.go`'s callbacks), try this same restructuring (no receiver/captured-state access inside the closure) before assuming it's the apartment/threading class of bug again.
-
-RGB LED color feedback still not testable (common-anode button replacement still on order) — everything else in this feature is done.
-
-### ✓ 6. Master State Sync on Connect — COMPLETE, all hardware-verified
-
-Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-coded to 512 on power-on because it has no way to know the host's actual current state.
-
-- On every beacon (`display.go` beacon handler, before `pushAll`), `DisplayManager.pushMasterState` sends `SET_MASTER_VOLUME` with the current master output volume and `SET_MIC_MUTE_STATE` with the current system mic mute state
-- Master volume source: `sessionMap.getMasterVolume()` reads the `"master"` session's `GetVolume()` (0.0–1.0 scalar), converted to raw `0–1023` (`uint16(vol*1023 + 0.5)`) to match the firmware's native domain
-- Mic mute source: `HIDManager.IsMicMuted()` → `MicMuter.IsMuted()` (Windows: `IAudioEndpointVolume.GetMute` on the default capture endpoint; Linux: `pactl get-source-mute @DEFAULT_SOURCE@`)
-- If the master session or mic state isn't available (e.g. session map not yet populated), the corresponding push is skipped rather than guessed
-- **Firmware side** — `processCmd` in `main.cpp` handles `0x04` (assigns `masterVol`, forces a bar redraw) and `0x05` (assigns `masterMuted`, forces an icon redraw + `applyRgbToHardware()`).
-- **Master volume: hardware-verified 2026-06-19.** Required a host-side bug fix (see below) in addition to the firmware handler — the firmware side alone was not sufficient.
-- **Mic mute: hardware-verified 2026-06-21**, alongside the live mute-tracking work below.
-
-**Bug found and fixed (2026-06-19):** `serial.go`'s `handleLine` primes `currentSliderPercentValues` to `-1.0` whenever the detected slider count changes, which is "significantly different" from anything and forces a `SliderMoveEvent` on the next read for every slider — including slider 0 (`slider_mapping: 0: master`). `session_map.go` then unconditionally calls `SetVolume()` for that event, which overwrote the real Windows master volume with whatever `masterVol` the firmware happened to boot with (hardcoded 512), racing against and clobbering `pushMasterState`'s sync-down value. Unlike faders 1–5 (a physical position that *should* snap app volumes on connect), slider 0 has no physical position — it's the encoder's last state, which is meaningless before the host has told it anything. Fix: slider 0's first reading after a slider-count change is now primed silently (baseline recorded in `currentSliderPercentValues[0]`, no move event emitted); faders 1–5 keep the original priming behavior.
-
-**Live tracking while connected — implemented 2026-06-20, bench-tested 2026-06-21 (confirmed NOT functional), root-caused and fixed 2026-06-21.** In addition to the connect-time sync above, `sessionMap` watches for *external* master volume changes (Windows volume mixer, media keys, another app) while SERENITY stays connected, and pushes them down via the same `SET_MASTER_VOLUME` command. This is push-based, not polled, on both platforms:
-- **Windows:** a hand-rolled `IAudioEndpointVolumeCallback` COM object is registered via `IAudioEndpointVolume.RegisterControlChangeNotify` (go-wca's own wrapper for this call is stubbed to `E_NOTIMPL`, so `session_finder_windows.go` calls the real vtable slot directly via `syscall.Syscall` — see `registerMasterVolumeChangeCallback`/`masterVolumeNotifyCallback`). The callback fires synchronously on the audio engine's own thread for every master volume/mute change and is filtered by comparing `guidEventContext` against deej's own `eventCtx` GUID, so deej's own writes (the SERENITY encoder) are recognized precisely, not just by a time heuristic.
-- **Linux:** `session_finder_linux.go` subscribes to PulseAudio's native event mechanism (`proto.Subscribe{Mask: paSubscriptionMaskSink}` + `client.Callback`), re-reading the default sink's volume only when a real sink-change event arrives.
-- Both implementations satisfy a shared `MasterVolumeWatcher` interface (`session_finder.go`); `sessionMap.setupMasterVolumeWatcher` forwards changes to `DisplayManager` only if they weren't just caused by deej itself (`sessionMap.markMasterVolumeSetByDeej`/`masterVolumeRecentlySetByDeej`, a 500ms window — the Linux watcher has no per-event context to compare against, so it relies on this generic backstop; Windows uses both the precise GUID check and this backstop).
-- **Do not implement this as a polling loop.** A prior attempt used a `time.Ticker` polling `getMasterVolume()` every 250ms; this was explicitly rejected as an unacceptable approach for a never-ending host-resident loop. The push-based mechanisms above were built specifically to avoid that — this constraint still holds; do not fall back to polling.
-- **Root cause found and fixed (2026-06-21):** `GetAllSessions()` in `session_finder_windows.go` called `ole.CoInitializeEx` then `defer ole.CoUninitialize()` around its entire body — including `registerDefaultDeviceChangeCallback()` and `registerMasterVolumeChangeCallback()`. Both register long-lived notification sinks against the STA apartment created by that `CoInitializeEx` call, but the deferred `CoUninitialize()` tore that exact apartment down the instant `GetAllSessions()` returned — before the audio engine ever got a chance to dispatch a callback into it. Registration itself succeeded (HRESULT 0), so nothing was ever logged as failing; the callback just silently never fired, matching the bench symptom exactly. Additionally, the calling goroutine was never pinned with `runtime.LockOSThread()`, so even within a single call the apartment's owning OS thread wasn't guaranteed stable. Fix: `GetAllSessions()` now calls `runtime.LockOSThread()` on entry (idempotent/refcounted, never unlocked — mirrors the existing pattern in `hotplug_windows.go`) and no longer calls `CoUninitialize()` at all; COM stays initialized on whichever OS threads end up calling this function for the life of the process, which is the standard pattern for a long-running background service and costs nothing meaningful for a tray app.
-- **Bench-verified 2026-06-21 with SERENITY connected.** Initial bench test showed the master OLED updating but lagging/stepping behind rapid host-side scrolling, and occasionally settling 3-5% off from the host's true final value. Root cause: `sf.masterVolumeChanges` (capacity 8, drop-newest-on-full) and the per-consumer fan-out (unbuffered, blocking send) formed a FIFO queue under load — a fast scroll fires far more notifications than the 115200-baud serial link can drain, so the queue filled and **new** (including the final) notifications got dropped while stale ones were still being processed. Fixed by making both hops capacity-1, latest-value-wins (evict-and-replace instead of drop-newest) — see `masterVolumeNotifyCallback` and `sessionMap.forwardMasterVolumeChange`. This fixed live smoothness but a final-value mismatch could still occur if the very last live notification was itself the one evicted right as scrolling stopped.
-- **Settle correction, added 2026-06-21.** The latest-value-wins fix above fixed smoothness, but occasional 3-5% final-state mismatches remained (the very last live notification can still be the one evicted right as scrolling stops). `sessionMap.setupMasterVolumeWatcher` runs a `masterVolumeSettleDelay` (100ms) debounce timer, reset on every forwarded live change. When it fires (no further change for 100ms), it re-reads the volume directly via `getMasterVolume()` — bypassing the live/coalescing path entirely — and forwards it as a `MasterVolumeUpdate{ForceSync: true}`. `DisplayManager.handleExternalMasterVolumeChange` always sends a `ForceSync` update, skipping the usual noise-threshold dedup. This alone wasn't sufficient — see the serial echo feedback loop below, found during the same bench session, which was actually starving the settle mechanism along with everything else.
-- **Serial echo feedback loop — found and fixed 2026-06-21, the real cause of "gets stuck and never catches up."** Bench testing (with the fixes above in place) showed the master OLED still lagging/stepping behind fast scrolling and, critically, never catching up at all if the user stopped scrolling mid-lag — which the 100ms settle correction should have prevented. Root cause, confirmed via debug logs: slot 0 ("master") in the device→host ASCII telemetry line (`masterVol|fader0|...`) was designed for a SERENITY encoder turn (real user input, should mirror to Windows) but SERENITY also echoes back whatever `masterVol` it currently holds on every regular line — including values *we* just pushed via `SET_MASTER_VOLUME`. `serial.go`'s `handleLine` couldn't tell the difference, so it read every echo as a fresh encoder move and called `session.SetVolume()` on it again. That re-write is correctly recognized as deej's own write by the GUID check, but it also re-arms `markMasterVolumeSetByDeej`'s 500ms suppression window (`session_map.go`) — and since the echo loop kept retriggering roughly every cycle during continuous scrolling, the window effectively never got a chance to expire, silently swallowing genuinely external Windows-side changes for the entire duration of the scroll. Fixed in two parts:
-  - `SerialWriter` (`serial_writer.go`) now tracks the last raw value sent via `SendMasterVolume` (`LastSentMasterVolumeRaw`) and when it was sent (`TimeSinceLastSentMasterVolume`).
-  - `handleLine` (`serial.go`) recognizes a slot-0 reading as an echo (and skips emitting a `SliderMoveEvent` for it) if it exactly matches the last-sent raw value, **or** if it arrives within `masterVolumeSerialEchoWindow` (200ms) of the last send. The exact-match check alone wasn't sufficient: a fast scroll can have multiple `SET_MASTER_VOLUME` pushes in flight before their echoes return, so an echo of an older, already-superseded push wouldn't match the *latest* sent value anymore, fell through as a "real" encoder move, and reapplied a stale value to Windows — the audible/visible "step backwards" the user described while scrolling. The 200ms window catches every in-flight echo regardless of how many pushes are queued ahead of it.
-  - This also explained the residual 1-2% drift on otherwise-isolated single steps even before the feedback-loop was firing continuously: each misread echo forced a redundant round trip through `NormalizeScalar`'s truncate-to-2-decimals, very slightly degrading an otherwise-precise value.
-- **Firmware rounding bug — found and fixed 2026-06-21, alongside the above.** Even with the feedback loop fixed, the firmware's master volume percentage display used integer-truncating division (`vol * 100 / 1023`) instead of rounding, biasing the displayed percentage down by up to ~1% versus Windows. Fixed in firmware (`main.cpp`'s `drawMasterNormal()`): `pct = (uint8_t)(((uint32_t)vol * 100 + 511) / 1023)` — round instead of truncate. See firmware CLAUDE.md for this side of the fix.
-- **All three fixes bench-verified together 2026-06-21:** slow/steady changes land on the exact host percentage every time; fast continuous scrolling no longer bounces backward and lands on the same final number as the host when scrolling stops, including the previously-reproduced 64%-vs-54% stuck case.
-- Added permanent debug-level logging at each stage of this pipeline (`registerMasterVolumeChangeCallback`, `masterVolumeNotifyCallback`, `sessionMap.setupMasterVolumeWatcher`) so any future regression here is immediately visible in `--verbose`/dev-build logs instead of failing silently again.
-- **Bonus finding (2026-06-21):** the same Windows notification struct (`audioVolumeNotificationData`, mirroring `AUDIO_VOLUME_NOTIFICATION_DATA`) already carries the master mute bit (`BMuted`) alongside the volume level (`FMasterVolume`) — it arrives in `masterVolumeNotifyCallback` today but is discarded; only `FMasterVolume` is read. This became the basis for "Master + Mic Mute Live Sync" below.
-
-**Master + Mic Mute Live Sync — implemented and bench-verified 2026-06-21.** Two-way mute tracking for both master volume and mic, following the same architecture as live master volume tracking above (push-based OS callbacks, not polling).
-
-- **Master mute (`volMuted`):** no new registration needed — `BMuted` was already arriving in the existing `masterVolumeNotifyCallback`/`registerMasterVolumeChangeCallback` registration (see "Bonus finding" above), just discarded. `MasterVolumeWatcher.SubscribeToMasterVolumeChanges()` now returns `<-chan MasterVolumeNotification{Volume, Muted}` instead of a bare `float32` (both platforms updated, including Linux's `GetSinkInfoReply.Mute`/`GetSourceInfoReply.Mute` fields, which the jfreymuth/pulse library already exposes). `sessionMap.MasterVolumeUpdate` carries `Muted` alongside `Volume`/`ForceSync` through the same forwarding/consumer-channel plumbing. `DisplayManager.handleExternalMasterVolumeChange` now pushes volume and mute independently (separate dedupe state, `lastPushedVolMuted`/`havePushedVolMuted`) since either can change without the other — muting via the mixer's mute button alone leaves the volume level untouched. Pushed via the new `SET_MASTER_MUTE_STATE` (`0x07`) command, both on connect (`pushMasterState`, via new `masterSession.GetMuted()`/`sessionMap.getMasterMuted()`) and live.
-- **Mic mute:** a *second*, independent `RegisterControlChangeNotify` registration (`registerMicMuteChangeCallback`/`micMuteNotifyCallback` in `session_finder_windows.go`), this time against `sf.masterIn.volume` (the default capture endpoint) instead of `sf.masterOut.volume`. New `MicMuteWatcher` interface (`SubscribeToMicMuteChanges() <-chan bool`), Windows-only — mirrors the rest of the mic-mute feature, which has no Linux implementation either. `sessionMap.setupMicMuteWatcher`/`forwardMicMuteChange` mirror the master volume watcher's consumer-fanout plumbing. Pushed via the existing `SET_MIC_MUTE_STATE` (`0x05`) — no new firmware command needed, since `processCmd`'s existing handler already does an absolute assignment regardless of *why* the state changed.
-- **Superseded 2026-06-22 — historical note, not current behavior:** at the time this feature shipped, SERENITY's `volMuted` was implemented as "zero the transmitted serial value," not a real WASAPI mute flag. Pushing `SET_MASTER_MUTE_STATE(true)` made firmware's regular ASCII output zero out, which round-tripped back through the slider-move path and forced Windows' *reported volume level* to 0% while muted via the mixer instead of preserving the level with just a mute flag — this is exactly what caused the "unmute leaves volume at 0" bug reported the next day. See "Master volume mute redesign" below for the fix: `SET_MASTER_MUTE_STATE` itself is unchanged, but it's no longer the only thing keeping the wire-level zeroed during mute.
-- **Crash found and fixed 2026-06-21: tagging the RGB button's `SetMute` call with a COM eventContext GUID.** To let `micMuteNotifyCallback` distinguish the RGB button's own writes from external ones (mirroring the master volume watcher's GUID filter), `windowsMicMuter.ToggleMute()` was changed to pass a real `*ole.GUID` (same value as `wcaSessionFinder.eventCtx`) instead of `nil` as `SetMute`'s second argument — even captured as a plain local *before* the closure, matching the existing "don't touch the receiver inside the closure" rule from the mic-mute crash history. **This crashed on the very first button press every time** (`Exception 0xc0000005`, access violation) — a console build's crash trace pointed exactly at the `aevSetMute` syscall itself (`iaudioendpointvolume_windows.go`), not at any of this codebase's Go logic. `SetMasterVolumeLevelScalar` uses an identical 3-arg syscall shape with a real (non-nil) GUID and has never crashed once across this entire session's live-volume testing — the only difference is the calling context: `ToggleMute` runs inside `withCaptureVolume`'s per-call `runtime.LockOSThread()`/fresh-`CoInitializeEx` cycle (the same fragile context already responsible for two earlier, structurally different crashes in this exact call path — see [[project-deejx-mic-mute-hid]]), not an ordinary goroutine. The precise mechanism was not root-caused (consistent with this codebase's established pattern for this specific area); fixed empirically by reverting `SetMute`'s eventContext argument to always `nil` and removing GUID-tagging from `windowsMicMuter` entirely. Self-triggered mic-mute writes are now recognized downstream by `sessionMap.markMicMuteSetByButton`/`micMuteRecentlySetByButton` — a plain time window (500ms, `micMuteEchoSuppressWindow`), exactly mirroring `markMasterVolumeSetByDeej`'s backstop, with **no COM/syscall involvement in the filtering itself.**
-- **A second, smaller bug found in the same bench session: a mark-after-toggle ordering race.** `hid.go`'s `handleReport` originally called `markMicMuteSetByButton()` *after* `h.muter.ToggleMute()` returned. But `SetMute`'s registered notification callback can fire synchronously, on the same call stack, *before* `ToggleMute` even returns — so the live watcher's suppression check could run before the mark was recorded, occasionally letting a button-triggered change through `setupMicMuteWatcher` as if it were external. Harmless in practice (both the button's direct push and the watcher's "external" push agreed on the same value, so it only meant an occasional redundant duplicate send, confirmed via debug logs), but not the intended single clean push. Fixed by moving `markMicMuteSetByButton()` to *before* `ToggleMute()` is called.
-- `micMuteNotifyCallback` does no work inline beyond copying the notification by value and spawning a goroutine (`handleMicMuteNotification`) to do the actual logging/filtering/channel-send — kept deliberately minimal given this callback can be reentered into Go-callback space while the triggering call (`ToggleMute`) is still inside its own locked-thread/syscall chain. Not proven necessary by itself (the actual crash was the GUID argument, not reentrancy), but cheap insurance given how fragile this exact code path has proven to be across three separate incidents now.
-- Bench-verified 2026-06-21: master mute and mic mute both work in both directions (SERENITY-initiated and Windows-initiated) with no crashes across repeated toggles, and no double-pushing once the ordering race was fixed.
+Live mic mute: separate `RegisterControlChangeNotify` on `sf.masterIn.volume` (default capture endpoint). `MicMuteWatcher` interface with `SubscribeToMicMuteChanges() <-chan bool`. Windows-only. Pushed via existing SET_MIC_MUTE_STATE (0x05).
 
 ---
 
@@ -267,7 +215,7 @@ Real, root-caused issues found while verifying builds/vet on this machine. Check
 
 ### Verifying the Linux build for real: use WSL
 
-This machine has WSL (Ubuntu 24.04) installed, with a real Go toolchain, gcc, and the GTK3/appindicator/webkit2gtk dev headers `systray` needs for its native cgo build (`golang-go`, `build-essential`, `pkg-config`, `libgtk-3-dev`, `libappindicator3-dev`, `libwebkit2gtk-4.1-dev` — installed 2026-06-20). Use it instead of cross-compiling or declaring Linux "unverifiable from here":
+This machine has WSL (Ubuntu 24.04) installed, with a real Go toolchain, gcc, and the GTK3/appindicator/webkit2gtk dev headers `systray` needs for its native cgo build. Use it instead of cross-compiling or declaring Linux "unverifiable from here":
 
 ```
 wsl -d Ubuntu -- bash -lc "cd '/mnt/c/Users/Steven/Documents/Solid Models/deej/Deej-X/Deej-X' && PKG_CONFIG_PATH=\$HOME/pkgconfig-shim go build ./... 2>&1"
@@ -278,98 +226,67 @@ wsl -d Ubuntu -- bash -lc "cd '/mnt/c/Users/Steven/Documents/Solid Models/deej/D
 - Installing/removing apt packages needs `sudo`, which requires an interactive password Claude doesn't have. Ask the user to run the `apt-get install` command themselves (the `!` prefix, or a one-line `wsl -d Ubuntu -- sudo ...` for a separate cmd/PowerShell window) rather than attempting to bypass this.
 - A harmless linker warning (`missing .note.GNU-stack section implies executable stack`) is normal on this cgo build and not a real issue.
 
-### `signal.Notify` with an unbuffered channel — fixed 2026-06-20
+### `signal.Notify` requires a buffered channel
 
-`pkg/deej/util/util.go`'s `SetupCloseHandler` used to create an **unbuffered** `chan os.Signal` passed to `signal.Notify`. `signal.Notify` does a non-blocking send to registered channels, so an unbuffered channel can silently drop the OS interrupt signal if nothing happens to be receiving at that exact instant. Fixed by buffering the channel (`make(chan os.Signal, 1)`). If `go vet` flags this pattern again elsewhere, apply the same fix — don't dismiss it as a pre-existing warning without checking.
+`pkg/deej/util/util.go`'s `SetupCloseHandler` uses `make(chan os.Signal, 1)` — `signal.Notify` does a non-blocking send and silently drops signals on unbuffered channels. If `go vet` flags this pattern elsewhere, apply the same fix.
 
 ### `go vet`'s `unsafeptr` check on Win32/COM callback structs
 
-When writing a hand-rolled COM callback (mirroring the `IMMNotificationClient` pattern already in `session_finder_windows.go`), declare pointer-typed callback parameters as their real pointer type (e.g. `pNotify *audioVolumeNotificationData`), **not** `uintptr` plus a manual `unsafe.Pointer(uintptr)` cast inside the function body. `syscall.NewCallback` marshals typed pointer arguments directly — see the existing `this *wca.IMMNotificationClient` parameter on `defaultDeviceChangedCallback`. Converting a `uintptr` to `unsafe.Pointer` after the fact is exactly the pattern `go vet`'s `unsafeptr` check flags (fabricating a pointer from an arbitrary integer), even though it happens to be safe in practice here (the memory belongs to the OS/COM caller, not the Go GC). Use the typed-parameter form so vet stays clean instead of suppressing or excusing the warning.
+When writing a hand-rolled COM callback, declare pointer-typed callback parameters as their real pointer type (e.g. `pNotify *audioVolumeNotificationData`), **not** `uintptr` plus a manual `unsafe.Pointer(uintptr)` cast inside the function body. `syscall.NewCallback` marshals typed pointer arguments directly — see the existing `this *wca.IMMNotificationClient` parameter on `defaultDeviceChangedCallback`. Converting a `uintptr` to `unsafe.Pointer` after the fact is exactly the pattern `go vet`'s `unsafeptr` check flags.
 
 ---
 
 ## Remaining Work
 
-### Master volume mute redesign (Windows only) — implemented 2026-06-22, compiles clean, NOT YET hardware bench-tested
+### Master Volume Mute Redesign (Windows) — compiles clean, NOT YET bench-tested
 
-Root cause of the 2026-06-21 bug report (encoder mute non-functional / unmute leaving volume at 0): the master mute mechanism was "zero the transmitted serial value" (see superseded note in "Master + Mic Mute Live Sync" above), which the host's ordinary slider pipeline read as a real volume-level write, permanently overwriting the actual Windows level with no record of what to restore. Replaced with a real WASAPI mute, mirroring how mic mute already works, so the underlying level is never touched by muting:
+Real WASAPI mute on the master output, mirroring how mic mute works. Implemented:
+- `masterSession.SetMuted(bool) error` (`session_windows.go`) — `s.volume.SetMute(muted, s.eventCtx)`. GUID echo-filtering works via existing `masterVolumeNotifyCallback` check; no time-window fallback needed for the output endpoint.
+- `sessionMap.toggleMasterMuted() (bool, error)` (`session_map.go`) — reads current mute, flips it, calls `markMasterVolumeSetByDeej()`.
+- `DisplayManager.handleMasterMuteToggleRequest()` (`display.go`) — handler for CMD_REQUEST_MASTER_MUTE_TOGGLE (0x08): calls `toggleMasterMuted()`, pushes result via `SendMasterMuteState`/0x07, updates `lastPushedVolMuted`/`havePushedVolMuted`.
+- Linux `SetMuted`/`toggleMasterMuted` not yet implemented (`session_linux.go`).
 
-- **`masterSession.SetMuted(bool) error`** (`session_windows.go`) — calls `s.volume.SetMute(muted, s.eventCtx)`, tagged with the same `eventCtx` GUID `SetVolume` already uses successfully on this endpoint. Unlike mic's capture endpoint (`windowsMicMuter.ToggleMute`), which crashes if `SetMute` is given a real GUID (see Feature 4 above / `hid_windows.go`), the master output endpoint has never shown that crash across this session's extensive live-volume testing with the same GUID via `SetVolume` — so this gets GUID-based echo filtering "for free" via the existing check in `masterVolumeNotifyCallback`, no time-window-only fallback needed.
-- **`sessionMap.toggleMasterMuted() (bool, error)`** (`session_map.go`) — reads current mute via the existing `muteGetter` pattern, flips it via the new `SetMuted`, and calls the existing `markMasterVolumeSetByDeej()` so the platform-agnostic time-window backstop in `setupMasterVolumeWatcher` also recognizes this as deej's own write, on top of the GUID filter at the source.
-- **`DisplayManager.handleMasterMuteToggleRequest()`** (`display.go`) — the new device-command handler for `CMD_REQUEST_MASTER_MUTE_TOGGLE` (`0x08`, see protocol table above): calls `toggleMasterMuted()` and pushes the result back down immediately via the existing `SendMasterMuteState`/`0x07`, the same "act now, push the result myself" pattern `HIDManager.handleReport` already uses for the mic button, rather than waiting on the generic watcher round-trip. Also updates `lastPushedVolMuted`/`havePushedVolMuted` so the live-sync dedupe state stays consistent.
-- **Feedback-loop question, resolved before implementing:** does the encoder-caused real mute toggle echo back through `setupMasterVolumeWatcher` and cause a redundant/racing second push? No — both the GUID match (`masterVolumeNotifyCallback`) and the time-window check (`masterVolumeRecentlySetByDeej`) already exist and are reused as-is; no new suppression mechanism was needed, unlike mic mute which needed a dedicated crash workaround for this exact problem (Feature 4 above).
-- **Firmware side:** `masterOut` (the ASCII-line wire value) is now always the real `masterVol`, never zeroed for mute. The encoder's single-click handler still flips `volMuted` locally first for instant feedback, then sends `CMD_REQUEST_MASTER_MUTE_TOGGLE` — see firmware CLAUDE.md "Master volume mute redesign" for the firmware-side detail.
-- **Explicitly Windows-only.** Linux host parity is deferred to a dedicated follow-up session once the Windows version is confirmed working on the bench — `paSession`/`session_linux.go` has no equivalent `SetMuted`/`toggleMasterMuted` support yet.
-- **Still needed: bench verification.** Not yet flashed/tested on hardware — confirm encoder mute/unmute restores the real level, external Windows-mixer mute/unmute still works, and rapid repeated clicks don't desync `volMuted` from real WASAPI state.
+**Still needed:** bench verify encoder mute/unmute restores the real level, external Windows-mixer mute/unmute still works, and rapid repeated clicks don't desync `volMuted` from WASAPI state.
 
-### Global Mic Mute (mute all inputs, unmute one) — NOT DESIGNED IN DETAIL, discussion only (2026-06-21)
+### Global Mic Mute (mute all inputs, unmute one) — NOT DESIGNED
 
-Today's mic mute (`windowsMicMuter`, Feature 4 above) only ever touches **the OS default capture device** — `withCaptureVolume` calls `GetDefaultAudioEndpoint(ECapture, EConsole, ...)`, a single device, every time. There's no per-device targeting for mic mute at all today (the friendly-name device targeting that exists for `slider_mapping` is a volume-only mechanism, unrelated).
-
-**Desired behavior, discussed 2026-06-21:**
-- **Mute** (RGB button) → mute **every active input device**, not just the default. Mechanism: enumerate all active capture endpoints (Windows: `IMMDeviceEnumerator.EnumAudioEndpoints(ECapture, DEVICE_STATE_ACTIVE, ...)`, mirroring the existing output-device enumeration already in `enumerateAndAddSessions` — same pattern, `ERender` → `ECapture`; Linux: enumerate all PulseAudio sources instead of just `@DEFAULT_SOURCE@`) and call mute on each.
-- **Unmute** → only **one specific configured device** (by friendly name), leaving every other input device muted. Asymmetric by design.
-- **Config shape (proposed, not finalized):**
+Current mic mute only touches the OS default capture device. Desired behavior:
+- **Mute** → every active input device (`IMMDeviceEnumerator.EnumAudioEndpoints(ECapture, DEVICE_STATE_ACTIVE, ...)`)
+- **Unmute** → one specific configured device by friendly name only (asymmetric by design)
+- Host must track an explicit "intended" state so hotplugged devices inherit it
+- **Do not implement the partial-state icon** (mic+slash+exclamation) until the definition of "partial" is resolved — see firmware CLAUDE.md "RGB button mic mute"
+- Config shape (proposed, not finalized):
   ```yaml
   mic_mute:
-    mute_target: input.global          # sentinel meaning "every active input device"
-    unmute_target: "USB Microphone"    # friendly name, exactly one device
+    mute_target: input.global
+    unmute_target: "USB Microphone"
   ```
-- **Host must track an explicit "intended" global state**, not just react to queried device states — so a newly-connected input device (hotplug) inherits the current intended state on arrival: mute it immediately if the intended state is "muted," leave it alone if "unmuted."
-- **Live mic-mute tracking for the single default capture device is done** (see "Master + Mic Mute Live Sync" above) — but that mechanism only watches *one* device's mute bit. If the mute-all/unmute-one design above is built, this watcher will need to expand to track the multi-device aggregate state, not just one device's `BMuted` flag.
-- **Third "partial" master-OLED icon state — flagged for further discussion before implementation, not specced.** Idea floated: if observed device states diverge from the intended target (mic + slash + exclamation mark icon, distinct from today's two-state slash/no-slash). Unresolved before this can be designed: exact definition of "partial" — since the asymmetric unmute-one-device design means *every* routine unmute leaves other devices still muted, "not all devices share state" can't be the trigger (that'd fire constantly); a tighter definition like "observed device states don't match what the last button action should have produced" was proposed but not confirmed. Also unresolved: what the RGB LED should show during that state (firmware side — see firmware CLAUDE.md "RGB button mic mute"). **Do not implement any part of the partial-state icon until this is revisited.**
-- Entirely host-side except the partial-icon piece, which is firmware-side (tri-state `masterMuted`, new icon bitmap, `SET_MIC_MUTE_STATE` payload needs a third value).
-
-### Per-Channel Mute from Host — maybe, depending on firmware flash availability; not a true todo
-
-Idea: if a user mutes a specific app's session directly in the OS volume mixer, reflect that on the channel's physical mute LED/state on SERENITY. Deprioritized 2026-06-21 — judged an unlikely scenario, not worth the cost right now. Would need: a new device-bound protocol command (none exists — firmware's `processCmd` has no per-channel mute case, and adding one costs flash); host-side per-session mute support, which doesn't exist either — `session.go`'s `Session` interface only has a commented-out `// TODO: future mute support` (`GetMute()`/`SetMute()`), never implemented.
 
 ### Linux HID Enumeration
 
-Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/hidraw*` and matching VID/PID via `/sys/class/hidraw/<dev>/device/uevent`.
+Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/hidraw*` and matching VID/PID via `/sys/class/hidraw/<dev>/device/uevent`.
 
 ### Screensaver Hardware Verification
 
-`CMD_REQUEST_ICON_REDRAW` handling, the 36×36 icon resize, and `readFrames()` all build and the existing unit-level logic is unchanged for normal (centered) pushes, but none of this has been exercised against real hardware yet — needs a bench test of the full idle → screensaver → wake cycle once the firmware side is flashed. See firmware CLAUDE.md "Current State → Implemented, pending hardware verification."
+`CMD_REQUEST_ICON_REDRAW` / `LoadAt()` / screensaver bounce not yet exercised on real hardware. Needs a bench test of the full idle → screensaver → wake cycle once the firmware side is flashed.
 
-### Process Group Channels (e.g. `deej.steam`)
+### Process Group Channels (e.g. `deej.steam`) — NOT DESIGNED IN DETAIL
 
-**Idea (not yet designed in detail):** a slider should be able to target a *named group* of processes defined in a separate file — e.g. a `SteamGames` group listing `cyberpunk2077.exe`, `thelastofus.exe`, `mahjong.exe`, etc. — instead of listing every process individually in `slider_mapping`. One slider would control the volume of whichever of those processes happens to be running, and the channel OLED would show a single representative icon (e.g. Steam's) rather than per-game icons.
+A slider targets a named group of processes (from a separate file) instead of listing them individually. Explicit per-channel `slider_mapping` assignments win over group membership.
 
-**Priority rule:** if a process is both (a) listed in the group file and (b) explicitly assigned to its own separate channel in `slider_mapping`, the explicit per-channel assignment wins — that process is excluded from the group for volume-control purposes (it shouldn't be controlled by two sliders at once).
+Likely plugs into `applyTargetTransform()` in `session_map.go` alongside existing `deej.current`/`deej.unmapped`. Group file format TBD. Icon: `pushAll()` would need a special case to load a representative group icon rather than deriving from `targets[0]`.
 
-**Where this likely plugs in**, based on the existing special-target mechanism in `session_map.go`:
-- `specialTargetTransformPrefix` ("deej.") already dispatches to `applyTargetTransform()`, which currently only handles `deej.current` and `deej.unmapped`. A new case (`deej.steam`, or a generic `deej.group:<name>` if multiple groups are wanted) would read the group file, return all matching session keys as `resolvedTargets`, minus any process name that's also explicitly mapped to a *different* slider elsewhere in `SliderMapping` (the override case above) — `sessionMapped()` already walks the full mapping table, so the exclusion check can reuse that pattern.
-- The group file itself: format TBD ("doesn't need to be a .yaml" per discussion) — could be a new top-level config key (a path, like `icon_dir`) or a section inside `config.yaml`. Needs a decision before implementation.
-- Icon side: `display.go`'s `pushAll()` currently loads an icon by treating `targets[0]` as a literal process name (`icon.Load(processName, ...)`). A group-targeted channel would need a special case (similar to the existing `processName == "master"` skip) that loads a fixed group icon (e.g. `steam.png`) instead of trying to resolve one of the many underlying game executables.
+### Decouple Icon Selection from Process Name — DISCUSS BEFORE IMPLEMENTING
 
-### Decouple Icon Selection from Process Name — DISCUSS FURTHER BEFORE IMPLEMENTATION
+Currently icon lookup is keyed off `targets[0]` from `slider_mapping` (lowercased, `.exe` stripped) — channel label has no effect. Idea: optional explicit icon key per channel, defaulting to current behavior. Overlaps with process group feature. Open questions: config shape, precedence, ordering relative to process groups.
 
-**Current behavior:** icon association has nothing to do with `channel_names` (the OLED display label) — it's keyed entirely off `slider_mapping`. `pushAll()` in `display.go` takes `targets[0]` for a channel's slider mapping (e.g. `firefox.exe`) and `icon.Load()` lowercases it, strips `.exe`, and looks for that exact filename in `icon_dir` (`firefox.png`). Renaming the channel label to "Browser" has zero effect on icon lookup. Also: if a slider maps to multiple processes, only `targets[0]` is used for the icon — the rest are ignored for icon purposes.
+### Remove Dithering Support — DECIDED, not yet implemented
 
-**Idea:** add an explicit, optional icon key per channel/slider (defaulting to the current process-name-derived behavior if unset, so existing configs don't break), so a channel labeled "Browser" mapped to `firefox.exe` could explicitly declare `icon: firefox` (or similar) without relying on the process name matching a filename. This also gives the process-group feature above (`deej.steam`) a clean way to declare its own representative icon explicitly instead of needing another special case.
+In `channel_icon.go`: drop `applyFloydSteinberg`/`applyFloydSteinbergAlpha`, collapse `switch conversion` branches to threshold-only. Remove `icon_conversion` from `config.go`/`config.yaml` and `IconConversion` plumbing in `display.go`'s `pushAll()`/`handleIconRedrawRequest`.
 
-**Open questions to resolve before building this:** exact config shape (per-slider field vs. a separate icon-mapping section), precedence if both an explicit icon key and a same-named PNG exist, and whether this should land before or after the process-group feature since they overlap (a group's icon is a more general case of "icon not derived from process name").
+### Soft Takeover — NOT DESIGNED
 
-### Remove Dithering Support
-
-**Decided — remove.** Floyd-Steinberg dithering hasn't shown a visible benefit on icon edges at 36×36; for flat-color app logos, edge aliasing happens either way and dithering tends to scatter stray pixels near edges rather than smooth them. Removing it simplifies the pipeline and the user-facing config surface (one less thing to configure/explain).
-
-**What changes:** in `pkg/deej/icon/channel_icon.go`, collapse `loadMono` to always threshold (drop the `applyFloydSteinberg` / `applyFloydSteinbergAlpha` functions and the `switch conversion` branches in both the transparency and opaque paths). Remove the `icon_conversion` config key from `config.go`/`config.yaml` and `IconConversion` plumbing in `display.go`'s `pushAll()`/`handleIconRedrawRequest`. Update the "Conversion" row in this file's Icon Protocol — Decided table and the Config keys table.
-
----
-
-### Soft Takeover — Move to Host, and Extend to Connect-Time Sync — NOT DESIGNED, discussion only
-
-**Current state:** soft takeover on per-channel mute/unmute lives entirely in firmware (see `kFaderOrder`-indexed `takeoverPending`/`takeoverTarget`/`takeoverSide` arrays and the freeze-until-crossed logic in `main.cpp`'s `updateMuteButtons()` and the serial send loop — see firmware CLAUDE.md). Separately, on host connect/power-up, faders 1–5 currently snap-jump app volume to the physical slider position instantly (see `serial.go`'s `handleLine` priming logic) — no takeover behavior at connect time.
-
-**Idea discussed (2026-06-21), not yet designed:** consolidate the takeover decision logic (capture target, track which side the live value is on, freeze output until crossed) into the host alone, as a single shared implementation reusable for both (a) per-channel mute/unmute and (b) a new connect-time case: if a slider's physical position differs from the app's current volume on connect, freeze that channel's effective volume at the app's setpoint until the physical slider is moved through it, instead of snap-jumping.
-
-**Why this looked appealing:** measured the actual flash cost of the firmware-side takeover logic by building a stripped copy — only ~176 bytes (0.6% of the 32KB budget), so flash savings is not the motivation. The real case for consolidating is avoiding two parallel implementations of the same crossing algorithm in two languages/places (firmware C++ for mute-unmute, host Go for connect-time) — one implementation is easier to reason about, test, and iterate on (host restart vs. ISP re-flash). The "firmware mute is autonomous without the host" objection does not hold — the device has no local audio path; nothing it does has any effect without the host translating serial data into Windows volume API calls, same as the faders. So host-only mute is not a functional regression.
-
-**Real remaining cost, not yet resolved:** state sync across connect/reconnect. If the host becomes sole authority for mute/takeover state, the firmware's local `muted[]`/LED state and the host's notion of "is this channel muted" need to agree on every connect — the same class of problem already solved once for master volume (`pushMasterState`, see Feature 6 above and its "boots at 50%" bug writeup). Likely needs an equivalent "host pushes/learns per-channel mute state on connect" step, plus a decision on whether the mute LED stays instant/local (button press → LED, no serial round trip) even though the actual volume effect becomes host-mediated.
-
-**Open questions, not addressed:** exact protocol change needed (new device→host "mute toggled" command; firmware would need to stop zeroing its own serial output and always send raw `cur[i]`, deferring the zero/freeze decision to host); how a slider mapped to multiple sessions (process groups) picks a single reference target volume to gate crossing on; whether this should be gated behind a config option or replace the snap-jump behavior outright.
+Move takeover logic to host (currently firmware-only for per-channel mute) and extend to connect-time: faders 1–5 currently snap-jump on connect; could freeze at app setpoint until the physical fader crosses it. Open: exact protocol changes needed, multi-session slider target resolution, whether this replaces snap-jump outright or is config-gated.
 
 ---
 
@@ -395,21 +312,21 @@ Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/h
 |---|---|
 | Source file format | PNG, any resolution — host resizes at runtime |
 | File naming | Process name from `slider_mapping` with `.exe` stripped — `firefox.png`, `spotify.png` |
-| Displayed icon size | 36×36 pixels (reduced from 48×48 to leave bounce room for the channel screensaver — see firmware CLAUDE.md Display Design) |
+| Displayed icon size | 36×36 pixels (reduced from 48×48 to leave bounce room for screensaver) |
 | Wire format | 768 bytes — full 128×48 blue area in SSD1306 page order; icon at a given offset (46px horizontal / 6px vertical padding when centered) |
 | Bit order | SSD1306 native: each byte = one column of 8 vertical pixels; bit 0 = topmost pixel of page |
-| Conversion | Configurable: `dither` (Floyd-Steinberg) or `threshold`; set via `icon_conversion` in `config.yaml` |
+| Conversion | Always threshold (dithering removed — see "Remove Dithering Support") |
 | `master` slot (index 0) | Skip icon push — master OLED is encoder-controlled, not a channel display |
-| `deej.unmapped` slot | Use bundled default icon; user can override by placing `unmapped.png` in `icon_dir` |
-| `system` slot | Use bundled default icon; user can override by placing `system.png` in `icon_dir` |
+| `deej.unmapped` slot | Use bundled default icon; user can override with `unmapped.png` in `icon_dir` |
+| `system` slot | Use bundled default icon; user can override with `system.png` in `icon_dir` |
 
-**TODO:** Design and bundle default icons for `deej.unmapped` and `system` slots. These ship with the package as fallback; user can drop their own file in `icon_dir` to override.
+**TODO:** Design and bundle default icons for `deej.unmapped` and `system` slots.
 
 ## TBD — Do Not Assume These
 
 | Item | Blocked on |
 |---|---|
-| *(none currently)* | Custom HID report format (mic mute) was the only entry here — decided 2026-06-21: report ID 4, vendor-defined usage page 0xFF00, 1-byte payload (`kMicMuteDesc` in firmware `main.cpp`); see "System Mic Mute via HID" above |
+| *(none currently)* | |
 
 ---
 

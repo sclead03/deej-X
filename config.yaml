@@ -10,6 +10,10 @@
 # windows only - you can use a device's full name, i.e. "Speakers (Realtek High Definition Audio)", to bind it. this works for both output and input devices
 # windows only - you can use 'system' to control the "system sounds" volume
 
+# number of active fader channels (0–5); firmware ignores OLEDs, buttons, and faders beyond this count
+# 0 = master-only mode (no channel OLEDs, faders, or mute buttons)
+num_sliders: 5
+
 # remap physical fader order without reflashing firmware
 # fader_order[i] = which physical fader position (0-4) feeds logical slot i
 # example: swap faders 0 and 1 → [1, 0, 2, 3, 4]

@@ -76,7 +76,8 @@ func (dm *DisplayManager) TriggerPush() {
 	dm.pushAll(writer, false)
 }
 
-// pushEncoderConfig sends the gesture action mapping and click-window duration from config.
+// pushEncoderConfig sends the gesture action mapping, click-window duration, and
+// active slider count from config.
 func (dm *DisplayManager) pushEncoderConfig(writer *SerialWriter) {
 	g := dm.deej.config.Gestures
 	if err := writer.SendGestureConfig(g.SingleClick, g.DoubleClick, g.TripleClick); err != nil {
@@ -90,6 +91,13 @@ func (dm *DisplayManager) pushEncoderConfig(writer *SerialWriter) {
 		dm.logger.Warnw("Failed to send click window", "error", err)
 	} else {
 		dm.logger.Debugw("Sent click window", "ms", ms)
+	}
+
+	n := uint8(dm.deej.config.NumSliders)
+	if err := writer.SendSliderCount(n); err != nil {
+		dm.logger.Warnw("Failed to send slider count", "error", err)
+	} else {
+		dm.logger.Debugw("Sent slider count", "numSliders", n)
 	}
 }
 
@@ -273,7 +281,7 @@ func (dm *DisplayManager) handleIconRedrawRequest(payload []byte) {
 		return
 	}
 	channel, xOffset, yOffset := int(payload[0]), int(payload[1]), int(payload[2])
-	if channel >= numChannels {
+	if channel >= dm.deej.config.NumSliders {
 		dm.logger.Warnw("Icon redraw request for out-of-range channel", "channel", channel)
 		return
 	}
@@ -350,7 +358,7 @@ func (dm *DisplayManager) pushAll(writer *SerialWriter, force bool) {
 	names := dm.deej.config.ChannelNames
 	iconDir := dm.deej.config.IconDir
 
-	for i := 0; i < numChannels; i++ {
+	for i := 0; i < dm.deej.config.NumSliders; i++ {
 		// name
 		name := names[i]
 		if force || name != dm.lastSentNames[i] {

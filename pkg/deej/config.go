@@ -64,6 +64,7 @@ type CanonicalConfig struct {
 
 	InvertSliders       bool
 	NoiseReductionLevel string
+	NumSliders          int
 	FaderOrder          []int
 	MasterLabel         string
 	ChannelNames        [numChannels]string
@@ -109,6 +110,11 @@ const (
 	configKeyGestureTripleClick    = "encoder_gestures.triple_click"
 	configKeyEncoderClickWindow    = "encoder_click_window_ms"
 	configKeyRGBButtonAction       = "rgb_button.action"
+	configKeyNumSliders            = "num_sliders"
+
+	defaultNumSliders   = 5
+	minNumSliders       = 0
+	maxNumSliders       = 5
 
 	defaultEncoderClickWindowMs = 250
 	minEncoderClickWindowMs     = 50
@@ -307,6 +313,22 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+
+	var numSliders int
+	if !cc.userConfig.IsSet(configKeyNumSliders) {
+		numSliders = defaultNumSliders
+	} else {
+		numSliders = cc.userConfig.GetInt(configKeyNumSliders)
+		if numSliders < minNumSliders || numSliders > maxNumSliders {
+			cc.logger.Warnw("num_sliders out of range, using default",
+				"value", numSliders,
+				"min", minNumSliders,
+				"max", maxNumSliders,
+				"default", defaultNumSliders)
+			numSliders = defaultNumSliders
+		}
+	}
+	cc.NumSliders = numSliders
 
 	rawOrder := cc.userConfig.GetIntSlice(configKeyFaderOrder)
 	if len(rawOrder) > 0 {

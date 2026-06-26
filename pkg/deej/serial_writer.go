@@ -23,6 +23,7 @@ const (
 	cmdSetMasterMute     = byte(0x07) // 0x06 and 0x08 are reserved device->host (CMD_REQUEST_ICON_REDRAW, CMD_REQUEST_MASTER_MUTE_TOGGLE - see display.go)
 	cmdSetGestureConfig  = byte(0x09) // 0x0A is reserved device->host (CMD_REQUEST_MIC_MUTE_ACTION - see display.go)
 	cmdSetClickWindow    = byte(0x0B)
+	cmdSetSliderCount    = byte(0x0C)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -165,6 +166,12 @@ func (sw *SerialWriter) SendClickWindow(ms uint16) error {
 	payload := make([]byte, 2)
 	binary.LittleEndian.PutUint16(payload, ms)
 	return sw.send(cmdSetClickWindow, payload)
+}
+
+// SendSliderCount pushes the active channel count (1–5) to SERENITY so it knows
+// which channel OLEDs, faders, and mute buttons to process.
+func (sw *SerialWriter) SendSliderCount(count uint8) error {
+	return sw.send(cmdSetSliderCount, []byte{count})
 }
 
 // SendGestureConfig pushes the encoder button gesture → action mapping to SERENITY.

@@ -60,8 +60,8 @@ func LoadAt(processName, iconDir string, xOffset, yOffset int) ([]byte, error) {
 // images are grayscaled and thresholded at 128.
 func loadMono(processName, iconDir string) ([]bool, error) {
 	base := strings.TrimSuffix(strings.ToLower(processName), ".exe")
-	if base == "deej.unmapped" {
-		base = "unmapped"
+	if strings.HasPrefix(base, "deej.") {
+		base = strings.TrimPrefix(base, "deej.")
 	}
 	p := filepath.Join(iconDir, base+".png")
 

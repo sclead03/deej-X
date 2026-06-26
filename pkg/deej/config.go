@@ -2,7 +2,9 @@ package deej
 
 import (
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v2"
 
 	"github.com/sclead03/deej-x/pkg/deej/util"
 )
@@ -69,6 +72,7 @@ type CanonicalConfig struct {
 	MasterLabel         string
 	ChannelNames        [numChannels]string
 	IconDir             string
+	ProcessGroups         map[string][]string
 	MicMute               MicMuteConfig
 	Gestures              GestureConfig
 	RGBButtonAction       string
@@ -111,6 +115,8 @@ const (
 	configKeyEncoderClickWindow    = "encoder_click_window_ms"
 	configKeyRGBButtonAction       = "rgb_button.action"
 	configKeyNumSliders            = "num_sliders"
+
+	groupsDir = "groups"
 
 	defaultNumSliders   = 5
 	minNumSliders       = 0
@@ -214,6 +220,8 @@ func (cc *CanonicalConfig) Load() error {
 		return fmt.Errorf("populate config fields: %w", err)
 	}
 
+	cc.loadProcessGroups()
+
 	cc.logger.Info("Loaded config successfully")
 	cc.logger.Infow("Config values",
 		"sliderMapping", cc.SliderMapping,
@@ -221,7 +229,8 @@ func (cc *CanonicalConfig) Load() error {
 		"invertSliders", cc.InvertSliders,
 		"masterLabel", cc.MasterLabel,
 		"channelNames", cc.ChannelNames,
-		"iconDir", cc.IconDir)
+		"iconDir", cc.IconDir,
+		"processGroups", cc.ProcessGroups)
 
 	return nil
 }
@@ -419,6 +428,49 @@ func parseGestureAction(name string, defaultAction byte, logger *zap.SugaredLogg
 	}
 	logger.Warnw("Unknown gesture action, using default", "name", name)
 	return defaultAction
+}
+
+// loadProcessGroups scans the groups/ directory and parses each *.yaml file as a
+// flat list of process names. The filename (without .yaml) becomes the group name,
+// usable as deej.<name> in slider_mapping. A missing groups/ directory is not an error.
+func (cc *CanonicalConfig) loadProcessGroups() {
+	cc.ProcessGroups = make(map[string][]string)
+
+	entries, err := os.ReadDir(groupsDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".yaml") {
+			continue
+		}
+
+		groupName := strings.ToLower(strings.TrimSuffix(strings.ToLower(name), ".yaml"))
+
+		data, err := os.ReadFile(filepath.Join(groupsDir, name))
+		if err != nil {
+			cc.logger.Warnw("Failed to read process group file", "file", name, "error", err)
+			continue
+		}
+
+		var processes []string
+		if err := yaml.Unmarshal(data, &processes); err != nil {
+			cc.logger.Warnw("Failed to parse process group file", "file", name, "error", err)
+			continue
+		}
+
+		for i, p := range processes {
+			processes[i] = strings.ToLower(p)
+		}
+
+		cc.ProcessGroups[groupName] = processes
+		cc.logger.Debugw("Loaded process group", "group", groupName, "members", processes)
+	}
 }
 
 func (cc *CanonicalConfig) onConfigReloaded() {

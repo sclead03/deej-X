@@ -1,0 +1,3 @@
+com_port: COM9
+baud_rate: 115200
+rough_count: 8

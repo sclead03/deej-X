@@ -228,56 +228,51 @@ func newMicMuter(logger *zap.SugaredLogger) (MicMuter, error) {
 	return &windowsMicMuter{logger: logger.Named("mic_muter")}, nil
 }
 
-// withCaptureVolume initializes COM and the default capture endpoint's
-// IAudioEndpointVolume, then hands it to fn for the duration of the call.
-// Pins this goroutine to its current OS thread for the duration of the call -
-// these are hand-rolled syscall-based COM bindings (go-wca), and letting the Go
-// scheduler migrate this goroutine to a different OS thread mid-call-chain (it's
-// never otherwise pinned - this runs on HIDManager's read-loop goroutine) was
-// observed to corrupt the Go heap (runtime "fatal error: fault", not a normal
-// panic) rather than cleanly erroring. Unlocked again before returning since
-// nothing here needs to outlive the call (contrast with the master-volume
-// watcher's registration in session_finder_windows.go, which is deliberately
-// never unlocked because it must persist).
-func (m *windowsMicMuter) withCaptureVolume(fn func(aev *wca.IAudioEndpointVolume) error) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+// queryCaptureAllMuted enumerates all active capture devices via de and returns
+// true only if every one of them is muted. Returns false if there are no active
+// capture devices. Assumes COM is already initialized on the calling thread.
+func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator) (bool, error) {
+	var dc *wca.IMMDeviceCollection
+	if err := de.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err != nil {
+		return false, fmt.Errorf("enum capture endpoints: %w", err)
+	}
+	defer dc.Release()
 
-	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
-		const eFalse = 1
-		oleError := &ole.OleError{}
-		if errors.As(err, &oleError) {
-			if oleError.Code() != eFalse {
-				return fmt.Errorf("CoInitializeEx: %w", err)
-			}
-		} else {
-			return fmt.Errorf("CoInitializeEx: %w", err)
+	var count uint32
+	if err := dc.GetCount(&count); err != nil {
+		return false, fmt.Errorf("get device count: %w", err)
+	}
+
+	if count == 0 {
+		return false, nil
+	}
+
+	for i := uint32(0); i < count; i++ {
+		var dev *wca.IMMDevice
+		if err := dc.Item(i, &dev); err != nil {
+			continue
+		}
+
+		var aev *wca.IAudioEndpointVolume
+		if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+			dev.Release()
+			continue
+		}
+
+		var muted bool
+		getMuteErr := aev.GetMute(&muted)
+		aev.Release()
+		dev.Release()
+
+		if getMuteErr != nil {
+			continue
+		}
+		if !muted {
+			return false, nil
 		}
 	}
-	defer ole.CoUninitialize()
 
-	var de *wca.IMMDeviceEnumerator
-	if err := wca.CoCreateInstance(
-		wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
-		wca.IID_IMMDeviceEnumerator, &de,
-	); err != nil {
-		return fmt.Errorf("create IMMDeviceEnumerator: %w", err)
-	}
-	defer de.Release()
-
-	var dd *wca.IMMDevice
-	if err := de.GetDefaultAudioEndpoint(wca.ECapture, wca.EConsole, &dd); err != nil {
-		return fmt.Errorf("get default capture endpoint: %w", err)
-	}
-	defer dd.Release()
-
-	var aev *wca.IAudioEndpointVolume
-	if err := dd.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
-		return fmt.Errorf("activate IAudioEndpointVolume: %w", err)
-	}
-	defer aev.Release()
-
-	return fn(aev)
+	return true, nil
 }
 
 // applyToDevices enumerates active capture devices and sets mute on those whose
@@ -387,14 +382,34 @@ func (m *windowsMicMuter) UnmuteDevices(targets []string) error {
 	return m.applyToDevices(false, targets)
 }
 
-// IsMuted reports the current system microphone mute state.
+// IsMuted reports whether all active capture devices are muted. Returns false
+// if no capture devices are active. Same LockOSThread/CoInitializeEx threading
+// discipline as applyToDevices — see that function for the full rationale.
 func (m *windowsMicMuter) IsMuted() (bool, error) {
-	var muted bool
-	err := m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
-		return aev.GetMute(&muted)
-	})
-	if err != nil {
-		return false, fmt.Errorf("get mute state: %w", err)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
+		const eFalse = 1
+		oleError := &ole.OleError{}
+		if errors.As(err, &oleError) {
+			if oleError.Code() != eFalse {
+				return false, fmt.Errorf("CoInitializeEx: %w", err)
+			}
+		} else {
+			return false, fmt.Errorf("CoInitializeEx: %w", err)
+		}
 	}
-	return muted, nil
+	defer ole.CoUninitialize()
+
+	var de *wca.IMMDeviceEnumerator
+	if err := wca.CoCreateInstance(
+		wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
+		wca.IID_IMMDeviceEnumerator, &de,
+	); err != nil {
+		return false, fmt.Errorf("create IMMDeviceEnumerator: %w", err)
+	}
+	defer de.Release()
+
+	return queryCaptureAllMuted(de)
 }

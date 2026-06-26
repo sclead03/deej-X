@@ -27,12 +27,10 @@ type MasterVolumeWatcher interface {
 	SubscribeToMasterVolumeChanges() <-chan MasterVolumeNotification
 }
 
-// MicMuteWatcher is implemented by session finders that can push live
-// notifications when the default capture (microphone) device's mute state
-// changes externally - e.g. Windows' own mic settings/taskbar, another app -
-// as opposed to via SERENITY's RGB button, which already round-trips through
-// HIDManager directly. Windows-only today, mirroring the rest of the mic-mute
-// feature (see hid_windows.go) - no Linux implementation exists.
+// MicMuteWatcher is implemented by session finders that can push live notifications
+// when the aggregate capture mute state changes — true only if every active capture
+// device is muted. Fires on changes to any capture device, not just the default.
+// Windows-only today (see hid_windows.go) — no Linux implementation exists.
 type MicMuteWatcher interface {
 	SubscribeToMicMuteChanges() <-chan bool
 }

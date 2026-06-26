@@ -39,14 +39,20 @@ type wcaSessionFinder struct {
 	masterVolumeChanges chan MasterVolumeNotification
 	aevCallback         *iAudioEndpointVolumeCallback
 
-	// pushes live mic (default capture device) mute changes (see MicMuteWatcher);
-	// micMuteCallback is registered against masterIn's IAudioEndpointVolume the
-	// same way aevCallback is registered against masterOut's. Capacity 1, same
-	// latest-value-wins reasoning as masterVolumeChanges, though in practice a
-	// mute toggle is a discrete event with no flooding concern - kept consistent
-	// with the volume watcher rather than for any pressing functional need.
-	micMuteChanges chan bool
+	// pushes live mic mute aggregate changes (see MicMuteWatcher); micMuteCallback
+	// is registered against every active capture device's IAudioEndpointVolume in
+	// registerMicMuteChangeCallback. A single shared callback instance handles all
+	// devices — on any notification it re-queries all devices and pushes true only
+	// if every one is muted. Capacity 1, latest-value-wins (same as masterVolumeChanges).
+	micMuteChanges  chan bool
 	micMuteCallback *iAudioEndpointVolumeCallback
+
+	// captureAevs holds the IAudioEndpointVolume references for every active capture
+	// device that has micMuteCallback registered. They must be kept alive for the
+	// duration of the registration — releasing a reference destroys the COM object
+	// and silently invalidates RegisterControlChangeNotify. Replaced (and old refs
+	// released) on each registerMicMuteChangeCallback call.
+	captureAevs []*wca.IAudioEndpointVolume
 }
 
 const (
@@ -194,15 +200,12 @@ func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 		}
 
 		sessions = append(sessions, sf.masterIn)
+	}
 
-		// live-track external changes to the mic mute state (Windows mic
-		// settings/taskbar, another app) - not changes via SERENITY's RGB
-		// button, which already round-trips through HIDManager directly and
-		// is filtered out here by GUID (see micMuteNotifyCallback). Best-effort,
-		// same reasoning as registerMasterVolumeChangeCallback above.
-		if err := sf.registerMicMuteChangeCallback(); err != nil {
-			sf.logger.Warnw("Failed to register mic mute change callback", "error", err)
-		}
+	// Register mic mute callbacks on all active capture devices (not just the default).
+	// Best-effort, same reasoning as registerMasterVolumeChangeCallback above.
+	if err := sf.registerMicMuteChangeCallback(); err != nil {
+		sf.logger.Warnw("Failed to register mic mute change callbacks", "error", err)
 	}
 
 	// enumerate all devices and make their "master" sessions bindable by friendly name;
@@ -270,16 +273,17 @@ func (sf *wcaSessionFinder) registerDefaultDeviceChangeCallback() error {
 	sf.mmNotificationClient = &wca.IMMNotificationClient{}
 	sf.mmNotificationClient.VTable = &wca.IMMNotificationClientVtbl{}
 
-	// fill the VTable with noops, except for OnDefaultDeviceChanged. that one's gold
 	sf.mmNotificationClient.VTable.QueryInterface = syscall.NewCallback(sf.noopCallback)
 	sf.mmNotificationClient.VTable.AddRef = syscall.NewCallback(sf.noopCallback)
 	sf.mmNotificationClient.VTable.Release = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.OnDeviceStateChanged = syscall.NewCallback(sf.noopCallback)
 	sf.mmNotificationClient.VTable.OnDeviceAdded = syscall.NewCallback(sf.noopCallback)
 	sf.mmNotificationClient.VTable.OnDeviceRemoved = syscall.NewCallback(sf.noopCallback)
 	sf.mmNotificationClient.VTable.OnPropertyValueChanged = syscall.NewCallback(sf.noopCallback)
 
 	sf.mmNotificationClient.VTable.OnDefaultDeviceChanged = syscall.NewCallback(sf.defaultDeviceChangedCallback)
+	// OnDeviceStateChanged fires when a device becomes active or inactive (e.g. USB mic plugged/unplugged).
+	// We need to re-register callbacks on newly-active devices and push the updated aggregate.
+	sf.mmNotificationClient.VTable.OnDeviceStateChanged = syscall.NewCallback(sf.deviceStateChangedCallback)
 
 	if err := sf.mmDeviceEnumerator.RegisterEndpointNotificationCallback(sf.mmNotificationClient); err != nil {
 		sf.logger.Warnw("Failed to call RegisterEndpointNotificationCallback", "error", err)
@@ -732,16 +736,16 @@ func (sf *wcaSessionFinder) masterVolumeNotifyCallback(this uintptr, pNotify *au
 	return
 }
 
-// registerMicMuteChangeCallback (re)registers our IAudioEndpointVolumeCallback
-// against the current sf.masterIn's IAudioEndpointVolume - same pattern as
-// registerMasterVolumeChangeCallback above, just targeting the capture endpoint
-// and a separate callback object (OnNotify needs to dispatch to micMuteNotifyCallback
-// instead of masterVolumeNotifyCallback).
+// registerMicMuteChangeCallback registers our IAudioEndpointVolumeCallback against
+// every currently-active capture device's IAudioEndpointVolume. A single shared
+// callback object handles all devices; on any notification it re-queries the full
+// aggregate state. Re-registration of the same callback on the same endpoint is a
+// no-op per WASAPI, so this is safe to call on each GetAllSessions refresh and
+// from the hotplug handler. The aev reference is released immediately after
+// registration — the audio engine holds its own reference and the registration
+// persists until UnregisterControlChangeNotify is called. Assumes COM is already
+// initialized on the calling thread (must be called from GetAllSessions context).
 func (sf *wcaSessionFinder) registerMicMuteChangeCallback() error {
-	if sf.masterIn == nil {
-		return errors.New("no master input session to register against")
-	}
-
 	if sf.micMuteCallback == nil {
 		sf.micMuteCallback = &iAudioEndpointVolumeCallback{
 			VTable: &iAudioEndpointVolumeCallbackVtbl{
@@ -753,40 +757,108 @@ func (sf *wcaSessionFinder) registerMicMuteChangeCallback() error {
 		}
 	}
 
-	aev := sf.masterIn.volume
+	var dc *wca.IMMDeviceCollection
+	if err := sf.mmDeviceEnumerator.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err != nil {
+		return fmt.Errorf("enum capture endpoints: %w", err)
+	}
+	defer dc.Release()
 
-	hr, _, _ := syscall.Syscall(
-		aev.VTable().RegisterControlChangeNotify,
-		2,
-		uintptr(unsafe.Pointer(aev)),
-		uintptr(unsafe.Pointer(sf.micMuteCallback)),
-		0)
-	if hr != 0 {
-		return ole.NewError(hr)
+	var count uint32
+	if err := dc.GetCount(&count); err != nil {
+		return fmt.Errorf("get device count: %w", err)
 	}
 
-	sf.logger.Debug("Registered mic mute change callback")
+	// Release previously-held aevs from the last registration cycle before
+	// repopulating. Releasing an aev would normally destroy the COM object and
+	// kill the registration, but since we're rebuilding the full list right now
+	// that's intentional — stale devices get cleaned up, active ones get fresh refs.
+	for _, old := range sf.captureAevs {
+		old.Release()
+	}
+	sf.captureAevs = sf.captureAevs[:0]
 
+	registered := 0
+	for i := uint32(0); i < count; i++ {
+		var dev *wca.IMMDevice
+		if err := dc.Item(i, &dev); err != nil {
+			continue
+		}
+
+		var aev *wca.IAudioEndpointVolume
+		if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+			dev.Release()
+			continue
+		}
+		dev.Release()
+
+		hr, _, _ := syscall.Syscall(
+			aev.VTable().RegisterControlChangeNotify,
+			2,
+			uintptr(unsafe.Pointer(aev)),
+			uintptr(unsafe.Pointer(sf.micMuteCallback)),
+			0)
+
+		if hr != 0 {
+			sf.logger.Warnw("Failed to register mic mute callback on device", "deviceIdx", i, "hr", hr)
+			aev.Release()
+			continue
+		}
+
+		// Keep aev alive — releasing it would destroy the COM object and silently
+		// invalidate the RegisterControlChangeNotify registration.
+		sf.captureAevs = append(sf.captureAevs, aev)
+		registered++
+	}
+
+	sf.logger.Debugw("Registered mic mute change callbacks on capture devices", "registered", registered, "total", count)
 	return nil
 }
 
-// micMuteNotifyCallback is invoked by the Windows audio engine whenever the
-// default capture endpoint's volume or mute state changes - including
-// synchronously, on the calling thread, when that change was caused by a
-// SetMute call on the very same endpoint (windowsMicMuter.ToggleMute, from
-// inside withCaptureVolume's runtime.LockOSThread()-pinned closure - the same
-// fragile context already responsible for two prior crashes in this codebase,
-// see project-deejx-mic-mute-hid memory). To keep this call's surface minimal
-// regardless, it does nothing but copy the notification by value and hand off
-// to a goroutine - the real logic happens there, fully decoupled from
-// whatever syscall stack triggered it.
+// allCaptureDevicesMuted reports whether every currently-active capture device is
+// muted. Returns false if there are no active capture devices. Initializes its own
+// COM apartment — safe to call from any goroutine (e.g. micMuteNotifyCallback's
+// spawned goroutine or handleDeviceStateChanged). Must NOT be called from a context
+// that already holds a CoInitializeEx without CoUninitialize (would decrement the
+// refcount prematurely); use the enumerator directly in that case.
+func (sf *wcaSessionFinder) allCaptureDevicesMuted() (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
+		const eFalse = 1
+		oleError := &ole.OleError{}
+		if errors.As(err, &oleError) {
+			if oleError.Code() != eFalse {
+				return false, fmt.Errorf("CoInitializeEx: %w", err)
+			}
+		} else {
+			return false, fmt.Errorf("CoInitializeEx: %w", err)
+		}
+	}
+	defer ole.CoUninitialize()
+
+	var de *wca.IMMDeviceEnumerator
+	if err := wca.CoCreateInstance(
+		wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
+		wca.IID_IMMDeviceEnumerator, &de,
+	); err != nil {
+		return false, fmt.Errorf("create IMMDeviceEnumerator: %w", err)
+	}
+	defer de.Release()
+
+	return queryCaptureAllMuted(de)
+}
+
+// micMuteNotifyCallback is invoked by the Windows audio engine whenever any
+// registered capture endpoint's volume or mute state changes — registered on
+// all active capture devices (not just the default), so it fires for any of them.
+// It does nothing but copy the notification by value and hand off to a goroutine;
+// the goroutine re-queries all capture devices for the aggregate muted state
+// rather than forwarding pNotify.BMuted from whichever single device fired.
 //
-// Unlike masterVolumeNotifyCallback, this has no GUID-based own-write filter:
-// ToggleMute's SetMute call always passes a nil eventContext (passing a real
-// *ole.GUID through that specific syscall reproduced a hard access violation
-// crash every time, root cause not fully understood - see ToggleMute's
-// comment in hid_windows.go). Self-triggered changes are filtered downstream
-// instead, by sessionMap's micMuteRecentlySetByButton time-window check.
+// No GUID-based own-write filter: SetMute always passes nil eventContext (a real
+// GUID caused a hard crash — see prior incident in memory). Self-triggered changes
+// are filtered downstream by sessionMap's micMuteRecentlySetByButton time-window.
 func (sf *wcaSessionFinder) micMuteNotifyCallback(this uintptr, pNotify *audioVolumeNotificationData) (hResult uintptr) {
 	if pNotify == nil {
 		return
@@ -799,9 +871,122 @@ func (sf *wcaSessionFinder) micMuteNotifyCallback(this uintptr, pNotify *audioVo
 }
 
 func (sf *wcaSessionFinder) handleMicMuteNotification(pNotify audioVolumeNotificationData) {
-	sf.logger.Debugw("Mic mute notify callback fired", "muted", pNotify.BMuted != 0)
+	sf.logger.Debugw("Mic mute notify callback fired", "deviceMuted", pNotify.BMuted != 0)
 
-	muted := pNotify.BMuted != 0
+	muted, err := sf.allCaptureDevicesMuted()
+	if err != nil {
+		sf.logger.Warnw("Failed to query all-capture-muted aggregate, using notified value", "error", err)
+		muted = pNotify.BMuted != 0
+	}
+
+	sf.logger.Debugw("Mic mute aggregate computed", "allMuted", muted)
+
+	select {
+	case sf.micMuteChanges <- muted:
+	default:
+		select {
+		case <-sf.micMuteChanges:
+		default:
+		}
+		select {
+		case sf.micMuteChanges <- muted:
+		default:
+		}
+	}
+}
+
+// deviceStateChangedCallback is invoked by Windows when any audio endpoint's state
+// changes (e.g. a USB microphone is plugged in or unplugged). Immediately hands off
+// to a goroutine to avoid blocking the audio engine's notification thread.
+func (sf *wcaSessionFinder) deviceStateChangedCallback(
+	this *wca.IMMNotificationClient,
+	pwstrDeviceId uintptr,
+	dwNewState uint32,
+) (hResult uintptr) {
+	go sf.handleDeviceStateChanged()
+	return
+}
+
+// handleDeviceStateChanged runs on its own goroutine when a capture device's state
+// changes. It re-registers the mic mute callback on all current active capture
+// devices (picking up any newly-active ones; re-registration on existing ones is a
+// no-op per WASAPI), then pushes the updated aggregate mute state to the firmware.
+func (sf *wcaSessionFinder) handleDeviceStateChanged() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
+		const eFalse = 1
+		oleError := &ole.OleError{}
+		if errors.As(err, &oleError) {
+			if oleError.Code() != eFalse {
+				sf.logger.Warnw("CoInitializeEx failed in handleDeviceStateChanged", "error", err)
+				return
+			}
+		} else {
+			sf.logger.Warnw("CoInitializeEx failed in handleDeviceStateChanged", "error", err)
+			return
+		}
+	}
+	defer ole.CoUninitialize()
+
+	if sf.micMuteCallback == nil {
+		return
+	}
+
+	var de *wca.IMMDeviceEnumerator
+	if err := wca.CoCreateInstance(
+		wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
+		wca.IID_IMMDeviceEnumerator, &de,
+	); err != nil {
+		sf.logger.Warnw("Failed to create IMMDeviceEnumerator in handleDeviceStateChanged", "error", err)
+		return
+	}
+	defer de.Release()
+
+	// Register mic mute callback on all current active capture devices, keeping
+	// aev references alive. Append to captureAevs so the main registration list
+	// stays coherent; the next GetAllSessions-triggered registerMicMuteChangeCallback
+	// will release and rebuild the full list cleanly.
+	var dc *wca.IMMDeviceCollection
+	if err := de.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err == nil {
+		var count uint32
+		if dc.GetCount(&count) == nil {
+			for i := uint32(0); i < count; i++ {
+				var dev *wca.IMMDevice
+				if err := dc.Item(i, &dev); err != nil {
+					continue
+				}
+				var aev *wca.IAudioEndpointVolume
+				if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+					dev.Release()
+					continue
+				}
+				dev.Release()
+				hr, _, _ := syscall.Syscall(
+					aev.VTable().RegisterControlChangeNotify,
+					2,
+					uintptr(unsafe.Pointer(aev)),
+					uintptr(unsafe.Pointer(sf.micMuteCallback)),
+					0)
+				if hr != 0 {
+					aev.Release()
+					continue
+				}
+				sf.captureAevs = append(sf.captureAevs, aev)
+			}
+		}
+		dc.Release()
+	}
+
+	// Push the updated aggregate state (using the same enumerator, already on this COM-initialized thread).
+	muted, err := queryCaptureAllMuted(de)
+	if err != nil {
+		sf.logger.Warnw("Failed to query aggregate after device state change", "error", err)
+		return
+	}
+
+	sf.logger.Debugw("Device state changed, pushing updated aggregate", "allMuted", muted)
 
 	select {
 	case sf.micMuteChanges <- muted:

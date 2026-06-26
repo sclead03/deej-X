@@ -15,6 +15,7 @@ require (
 	github.com/thoas/go-funk v0.7.0
 	go.uber.org/zap v1.15.0
 	golang.org/x/sys v0.8.0
+	gopkg.in/yaml.v2 v2.2.4
 )
 
 require (
@@ -45,5 +46,4 @@ require (
 	golang.org/x/text v0.3.2 // indirect
 	gopkg.in/Knetic/govaluate.v3 v3.0.0 // indirect
 	gopkg.in/ini.v1 v1.51.0 // indirect
-	gopkg.in/yaml.v2 v2.2.4 // indirect
 )

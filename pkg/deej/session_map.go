@@ -389,8 +389,17 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
 		for _, target := range targets {
 
-			// ignore special transforms
 			if m.targetHasSpecialTransform(target) {
+				// group targets: a session is "mapped" if it's listed in the group's definition
+				specialName := strings.TrimPrefix(strings.ToLower(target), specialTargetTransformPrefix)
+				if members, ok := m.deej.config.ProcessGroups[specialName]; ok {
+					for _, member := range members {
+						if member == session.Key() {
+							matchFound = true
+							return
+						}
+					}
+				}
 				continue
 			}
 
@@ -521,9 +530,36 @@ func (m *sessionMap) applyTargetTransform(specialTargetName string) []string {
 		}
 
 		return targetKeys
+
+	default:
+		if members, ok := m.deej.config.ProcessGroups[specialTargetName]; ok {
+			return m.filterGroupMembers(members)
+		}
 	}
 
 	return nil
+}
+
+// filterGroupMembers returns the group's process list with any process that is
+// explicitly named in slider_mapping removed — explicit assignments take priority
+// over group membership, matching the deej.unmapped exclusion behavior.
+func (m *sessionMap) filterGroupMembers(members []string) []string {
+	explicit := make(map[string]bool)
+	m.deej.config.SliderMapping.iterate(func(_ int, targets []string) {
+		for _, t := range targets {
+			if !m.targetHasSpecialTransform(t) {
+				explicit[strings.ToLower(t)] = true
+			}
+		}
+	})
+
+	var result []string
+	for _, member := range members {
+		if !explicit[member] {
+			result = append(result, member)
+		}
+	}
+	return result
 }
 
 func (m *sessionMap) add(value Session) {

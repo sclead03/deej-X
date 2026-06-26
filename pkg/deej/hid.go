@@ -29,7 +29,7 @@ const (
 type MicMuter interface {
 	MuteDevices(targets []string) error
 	UnmuteDevices(targets []string) error
-	IsMuted() (bool, error) // reads default capture device; used for connect-time state init
+	IsMuted() (bool, error) // true only if ALL active capture devices are muted
 }
 
 // HIDManager reads reports from the SERENITY HID interface and dispatches actions.
@@ -186,6 +186,15 @@ func (h *HIDManager) applyMicMuteAction(muted bool) {
 	if err != nil {
 		h.logger.Warnw("Failed to apply mic mute action", "muting", muted, "error", err)
 		return
+	}
+
+	// Read back the true aggregate state rather than trusting the intent —
+	// mute_action may target a subset of devices, so the post-apply aggregate
+	// is what the OLED icon should reflect.
+	if readback, err := h.muter.IsMuted(); err != nil {
+		h.logger.Warnw("Failed to read back aggregate mic mute state, using intent", "error", err)
+	} else {
+		muted = readback
 	}
 
 	h.currentMuted = muted

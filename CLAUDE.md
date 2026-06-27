@@ -52,6 +52,7 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
 | `icon_dir` | ✓ implemented | Directory containing PNG icon files; relative or absolute path |
 | `icon_conversion` | pending removal | See "Remove Dithering Support" in Remaining Work |
+| `d16_button.action` | ✓ implemented | Action for D16 (PF7) button press. Same values as encoder gesture actions: `masterVol_mute`, `play_pause`, `skip_forward`, `skip_back`, `mute_mic`, `unmute_mic`. Default `masterVol_mute`. |
 
 ---
 
@@ -83,6 +84,9 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 | `SET_MASTER_MUTE_STATE` | `0x07` | `[muted]` | `0x00` unmuted / `0x01` muted; master output WASAPI mute state |
 | `SET_GESTURE_CONFIG` | `0x09` | `[single][double][triple]` | Encoder gesture → action mapping; action IDs: 0=MasterVolMute 1=PlayPause 2=SkipForward 3=SkipBack 4=MicMute 5=MicUnmute. Pushed on every beacon. |
 | `SET_CLICK_WINDOW` | `0x0B` | `[ms_lo][ms_hi]` | Encoder click-window duration, uint16 LE, ms. Default 250; host enforces 50–1000. Pushed on every beacon. |
+| `SET_SLIDER_COUNT` | `0x0C` | `[count]` | Active channel count, uint8, 0–5. Firmware gates all channel interactions to this number. Pushed on every beacon. |
+| `SET_DISPLAY_GAP` | `0x0D` | `[gap]` | Inter-display dead pixel count, uint8, 0–100. Firmware stores in EEPROM. Pushed on every beacon. |
+| `SET_D16_ACTION` | `0x0E` | `[action]` | D16 button (PF7) gesture action, uint8, same action IDs as SET_GESTURE_CONFIG. Default MasterVolMute. Pushed on every beacon. |
 
 **Firmware → host CMD_IDs:**
 
@@ -90,9 +94,9 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 |---|---|---|---|
 | `CMD_REQUEST_ICON_REDRAW` | `0x06` | `[channel_idx][x_offset][y_offset]` | Screensaver: re-render icon at bounce offset instead of centered |
 | `CMD_REQUEST_MASTER_MUTE_TOGGLE` | `0x08` | none | Encoder single-click: perform OS-level master mute toggle |
-| `CMD_REQUEST_MIC_MUTE_ACTION` | `0x0A` | `[desired_state]` | Gesture-mapped mic mute/unmute. `0x00`=mute, `0x01`=unmute. Not yet implemented in firmware. |
+| `CMD_REQUEST_MIC_MUTE_ACTION` | `0x0A` | `[desired_state]` | Gesture-mapped mic mute/unmute. `0x00`=mute, `0x01`=unmute. |
 
-The two directions are independent namespaces. CMD_IDs `0x06`, `0x08`, `0x0A` are unassigned host→firmware; `0x09`, `0x0B` are unassigned firmware→host.
+The two directions are independent namespaces. CMD_IDs `0x06`, `0x08`, `0x0A` are unassigned host→firmware; `0x09`, `0x0B`, `0x0C`, `0x0D`, `0x0E` are unassigned firmware→host.
 
 ### Connection & Push
 

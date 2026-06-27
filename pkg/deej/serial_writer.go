@@ -24,6 +24,8 @@ const (
 	cmdSetGestureConfig  = byte(0x09) // 0x0A is reserved device->host (CMD_REQUEST_MIC_MUTE_ACTION - see display.go)
 	cmdSetClickWindow    = byte(0x0B)
 	cmdSetSliderCount    = byte(0x0C)
+	cmdSetDisplayGap     = byte(0x0D)
+	cmdSetD16Action      = byte(0x0E)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -174,11 +176,24 @@ func (sw *SerialWriter) SendSliderCount(count uint8) error {
 	return sw.send(cmdSetSliderCount, []byte{count})
 }
 
+// SendDisplayGap pushes the inter-display dead pixel count (0–100) to SERENITY.
+// SERENITY stores it in EEPROM and uses it on the next boot to space the startup
+// animation ship correctly across physical display gaps.
+func (sw *SerialWriter) SendDisplayGap(gap uint8) error {
+	return sw.send(cmdSetDisplayGap, []byte{gap})
+}
+
 // SendGestureConfig pushes the encoder button gesture → action mapping to SERENITY.
 // Each argument is one of the GestureAction* constants from config.go (0=MasterMute,
 // 1=PlayPause, 2=SkipForward, 3=SkipBack).
 func (sw *SerialWriter) SendGestureConfig(single, double, triple byte) error {
 	return sw.send(cmdSetGestureConfig, []byte{single, double, triple})
+}
+
+// SendD16Action pushes the D16 button → action mapping to SERENITY.
+// action is one of the GestureAction* constants from config.go.
+func (sw *SerialWriter) SendD16Action(action byte) error {
+	return sw.send(cmdSetD16Action, []byte{action})
 }
 
 func (sw *SerialWriter) send(cmdID byte, payload []byte) error {

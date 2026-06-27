@@ -68,6 +68,7 @@ type CanonicalConfig struct {
 	InvertSliders       bool
 	NoiseReductionLevel string
 	NumSliders          int
+	DisplayGapPixels    int
 	FaderOrder          []int
 	MasterLabel         string
 	ChannelNames        [numChannels]string
@@ -76,6 +77,7 @@ type CanonicalConfig struct {
 	MicMute               MicMuteConfig
 	Gestures              GestureConfig
 	RGBButtonAction       string
+	D16ButtonAction       byte
 	EncoderClickWindowMs  int
 
 	logger             *zap.SugaredLogger
@@ -114,13 +116,18 @@ const (
 	configKeyGestureTripleClick    = "encoder_gestures.triple_click"
 	configKeyEncoderClickWindow    = "encoder_click_window_ms"
 	configKeyRGBButtonAction       = "rgb_button.action"
+	configKeyD16ButtonAction       = "d16_button.action"
 	configKeyNumSliders            = "num_sliders"
+	configKeyDisplayGapPixels      = "display_gap_pixels"
 
 	groupsDir = "groups"
 
-	defaultNumSliders   = 5
-	minNumSliders       = 0
-	maxNumSliders       = 5
+	defaultNumSliders       = 5
+	minNumSliders           = 0
+	maxNumSliders           = 5
+	defaultDisplayGapPixels = 0
+	minDisplayGapPixels     = 0
+	maxDisplayGapPixels     = 100
 
 	defaultEncoderClickWindowMs = 250
 	minEncoderClickWindowMs     = 50
@@ -339,6 +346,17 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	}
 	cc.NumSliders = numSliders
 
+	displayGap := cc.userConfig.GetInt(configKeyDisplayGapPixels)
+	if displayGap < minDisplayGapPixels || displayGap > maxDisplayGapPixels {
+		cc.logger.Warnw("display_gap_pixels out of range, using default",
+			"value", displayGap,
+			"min", minDisplayGapPixels,
+			"max", maxDisplayGapPixels,
+			"default", defaultDisplayGapPixels)
+		displayGap = defaultDisplayGapPixels
+	}
+	cc.DisplayGapPixels = displayGap
+
 	rawOrder := cc.userConfig.GetIntSlice(configKeyFaderOrder)
 	if len(rawOrder) > 0 {
 		seen := make(map[int]bool, len(rawOrder))
@@ -388,6 +406,7 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	cc.Gestures.SingleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureSingleClick), GestureActionMasterMute, cc.logger)
 	cc.Gestures.DoubleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureDoubleClick), GestureActionPlayPause, cc.logger)
 	cc.Gestures.TripleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureTripleClick), GestureActionSkipForward, cc.logger)
+	cc.D16ButtonAction = parseGestureAction(cc.userConfig.GetString(configKeyD16ButtonAction), GestureActionMasterMute, cc.logger)
 
 	clickWindow := cc.userConfig.GetInt(configKeyEncoderClickWindow)
 	if clickWindow == 0 {

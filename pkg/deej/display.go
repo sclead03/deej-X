@@ -99,6 +99,20 @@ func (dm *DisplayManager) pushEncoderConfig(writer *SerialWriter) {
 	} else {
 		dm.logger.Debugw("Sent slider count", "numSliders", n)
 	}
+
+	gap := uint8(dm.deej.config.DisplayGapPixels)
+	if err := writer.SendDisplayGap(gap); err != nil {
+		dm.logger.Warnw("Failed to send display gap", "error", err)
+	} else {
+		dm.logger.Debugw("Sent display gap", "pixels", gap)
+	}
+
+	d16 := dm.deej.config.D16ButtonAction
+	if err := writer.SendD16Action(d16); err != nil {
+		dm.logger.Warnw("Failed to send D16 button action", "error", err)
+	} else {
+		dm.logger.Debugw("Sent D16 button action", "action", d16)
+	}
 }
 
 func (dm *DisplayManager) subscribeToSerialEvents() {

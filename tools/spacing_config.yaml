@@ -1,3 +1,6 @@
 com_port: COM9
 baud_rate: 115200
-rough_count: 8
+
+# Count the number of lines between displays after running rough_gap_spacing.exe
+# multiply that number by 8, enter here
+rough_display_gap_pixels: 65

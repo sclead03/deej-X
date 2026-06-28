@@ -3,6 +3,7 @@ package deej
 import (
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -39,8 +40,11 @@ type HIDManager struct {
 	muter  MicMuter
 	stopCh chan struct{}
 
-	// currentMuted is the host's authoritative mic-mute state, updated by button
-	// presses and by external OS changes forwarded via SetCurrentMuteState.
+	// stateMu protects currentMuted and currentMutedKnown: the HID readLoop
+	// goroutine writes them (handleReport, applyMicMuteAction) while the
+	// display.go goroutine also writes (SetCurrentMuteState) and reads (IsMicMuted)
+	// them concurrently.
+	stateMu           sync.Mutex
 	currentMuted      bool
 	currentMutedKnown bool
 }
@@ -76,8 +80,11 @@ func (h *HIDManager) Stop() {
 // button press or external change has been observed; otherwise queries the
 // default capture device (connect-time init path).
 func (h *HIDManager) IsMicMuted() (bool, error) {
-	if h.currentMutedKnown {
-		return h.currentMuted, nil
+	h.stateMu.Lock()
+	known, muted := h.currentMutedKnown, h.currentMuted
+	h.stateMu.Unlock()
+	if known {
+		return muted, nil
 	}
 	return h.muter.IsMuted()
 }
@@ -86,8 +93,10 @@ func (h *HIDManager) IsMicMuted() (bool, error) {
 // (e.g. from the Windows volume mixer) so that the next button press
 // correctly toggles from the real current state rather than a stale one.
 func (h *HIDManager) SetCurrentMuteState(muted bool) {
+	h.stateMu.Lock()
 	h.currentMuted = muted
 	h.currentMutedKnown = true
+	h.stateMu.Unlock()
 }
 
 func (h *HIDManager) run() {
@@ -197,8 +206,10 @@ func (h *HIDManager) applyMicMuteAction(muted bool) {
 		muted = readback
 	}
 
+	h.stateMu.Lock()
 	h.currentMuted = muted
 	h.currentMutedKnown = true
+	h.stateMu.Unlock()
 
 	writer := h.deej.serial.Writer()
 	if writer == nil {
@@ -229,12 +240,24 @@ func (h *HIDManager) handleReport(report []byte) {
 	default: // "mic_mute_toggle"
 		// Toggle from the last known state; query the OS if we haven't seen a
 		// change yet so we start in the right direction.
-		if !h.currentMutedKnown {
-			if muted, err := h.muter.IsMuted(); err == nil {
-				h.currentMuted = muted
+		h.stateMu.Lock()
+		known := h.currentMutedKnown
+		h.stateMu.Unlock()
+		if !known {
+			if queried, err := h.muter.IsMuted(); err == nil {
+				h.stateMu.Lock()
+				h.currentMuted = queried
+				h.currentMutedKnown = true
+				h.stateMu.Unlock()
+			} else {
+				h.stateMu.Lock()
+				h.currentMutedKnown = true
+				h.stateMu.Unlock()
 			}
-			h.currentMutedKnown = true
 		}
-		h.applyMicMuteAction(!h.currentMuted)
+		h.stateMu.Lock()
+		nowMuted := !h.currentMuted
+		h.stateMu.Unlock()
+		h.applyMicMuteAction(nowMuted)
 	}
 }

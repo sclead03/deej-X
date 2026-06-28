@@ -85,5 +85,5 @@ encoder_gestures:
 # unmute.all → unmute every active capture device
 # lists are supported: unmute_action: ["Razer BlackShark V2 Pro", "Realtek USB Audio"]
 mic_mute:
-  mute_action: HD Pro Webcam C920
-  unmute_action: HD Pro Webcam C920
+  mute_action: mute.all
+  unmute_action: unmute.all

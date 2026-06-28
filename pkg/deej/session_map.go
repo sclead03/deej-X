@@ -265,11 +265,11 @@ func (m *sessionMap) setupMasterVolumeWatcher(watcher MasterVolumeWatcher) {
 
 // setupMicMuteWatcher forwards live, externally-sourced mic mute changes
 // (Windows mic settings/taskbar, another app) from the platform's push-based
-// watcher to our own subscribers. Unlike master volume, no echo-suppression
-// window is needed here: changes caused by SERENITY's own RGB button are
-// already filtered out at the platform layer by GUID (see
-// wcaSessionFinder.micMuteNotifyCallback), since deej never writes mic mute
-// any other way.
+// watcher to our own subscribers. Unlike master volume there is no GUID-based
+// own-write filter here — SetMute always passes nil eventContext for mic mute
+// (a real GUID caused a hard crash, see hid_windows.go), so
+// micMuteRecentlySetByButton's time-window is the only echo suppression against
+// RGB button presses and encoder gestures that trigger mic mute actions.
 func (m *sessionMap) setupMicMuteWatcher(watcher MicMuteWatcher) {
 	changes := watcher.SubscribeToMicMuteChanges()
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -50,9 +51,12 @@ type wcaSessionFinder struct {
 	// captureAevs holds the IAudioEndpointVolume references for every active capture
 	// device that has micMuteCallback registered. They must be kept alive for the
 	// duration of the registration — releasing a reference destroys the COM object
-	// and silently invalidates RegisterControlChangeNotify. Replaced (and old refs
-	// released) on each registerMicMuteChangeCallback call.
-	captureAevs []*wca.IAudioEndpointVolume
+	// and silently invalidates RegisterControlChangeNotify. Rebuilt (old refs
+	// released first) on each registerMicMuteChangeCallback call and on each
+	// handleDeviceStateChanged call. captureAevsMu must be held when reading or
+	// writing this slice, as both callers run on different goroutines.
+	captureAevsMu sync.Mutex
+	captureAevs   []*wca.IAudioEndpointVolume
 }
 
 const (
@@ -768,6 +772,12 @@ func (sf *wcaSessionFinder) registerMicMuteChangeCallback() error {
 		return fmt.Errorf("get device count: %w", err)
 	}
 
+	// Lock before touching captureAevs: handleDeviceStateChanged runs on a
+	// goroutine spawned by the Windows audio callback and can run concurrently
+	// with this function.
+	sf.captureAevsMu.Lock()
+	defer sf.captureAevsMu.Unlock()
+
 	// Release previously-held aevs from the last registration cycle before
 	// repopulating. Releasing an aev would normally destroy the COM object and
 	// kill the registration, but since we're rebuilding the full list right now
@@ -908,9 +918,13 @@ func (sf *wcaSessionFinder) deviceStateChangedCallback(
 }
 
 // handleDeviceStateChanged runs on its own goroutine when a capture device's state
-// changes. It re-registers the mic mute callback on all current active capture
-// devices (picking up any newly-active ones; re-registration on existing ones is a
-// no-op per WASAPI), then pushes the updated aggregate mute state to the firmware.
+// changes. It fully rebuilds the captureAevs list under captureAevsMu (releasing
+// stale refs, re-registering micMuteCallback on all currently-active devices), then
+// pushes the updated aggregate mute state to the firmware. A full rebuild rather than
+// an append-only update avoids accumulating duplicate aev entries: the previous
+// append-only approach added ALL active devices on every state-change event, not
+// just newly-active ones, causing unbounded growth between session refreshes and an
+// unprotected concurrent write against registerMicMuteChangeCallback.
 func (sf *wcaSessionFinder) handleDeviceStateChanged() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -930,10 +944,6 @@ func (sf *wcaSessionFinder) handleDeviceStateChanged() {
 	}
 	defer ole.CoUninitialize()
 
-	if sf.micMuteCallback == nil {
-		return
-	}
-
 	var de *wca.IMMDeviceEnumerator
 	if err := wca.CoCreateInstance(
 		wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
@@ -944,40 +954,49 @@ func (sf *wcaSessionFinder) handleDeviceStateChanged() {
 	}
 	defer de.Release()
 
-	// Register mic mute callback on all current active capture devices, keeping
-	// aev references alive. Append to captureAevs so the main registration list
-	// stays coherent; the next GetAllSessions-triggered registerMicMuteChangeCallback
-	// will release and rebuild the full list cleanly.
-	var dc *wca.IMMDeviceCollection
-	if err := de.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err == nil {
-		var count uint32
-		if dc.GetCount(&count) == nil {
-			for i := uint32(0); i < count; i++ {
-				var dev *wca.IMMDevice
-				if err := dc.Item(i, &dev); err != nil {
-					continue
-				}
-				var aev *wca.IAudioEndpointVolume
-				if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
-					dev.Release()
-					continue
-				}
-				dev.Release()
-				hr, _, _ := syscall.Syscall(
-					aev.VTable().RegisterControlChangeNotify,
-					2,
-					uintptr(unsafe.Pointer(aev)),
-					uintptr(unsafe.Pointer(sf.micMuteCallback)),
-					0)
-				if hr != 0 {
-					aev.Release()
-					continue
-				}
-				sf.captureAevs = append(sf.captureAevs, aev)
-			}
+	// Full rebuild of captureAevs under lock. Release old aev refs first so stale
+	// devices are cleaned up, then enumerate and register fresh for all current
+	// active capture devices. captureAevsMu is also held by registerMicMuteChangeCallback
+	// on the session map goroutine, which may run concurrently with this function.
+	sf.captureAevsMu.Lock()
+	if sf.micMuteCallback != nil {
+		for _, old := range sf.captureAevs {
+			old.Release()
 		}
-		dc.Release()
+		sf.captureAevs = sf.captureAevs[:0]
+
+		var dc *wca.IMMDeviceCollection
+		if err := de.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err == nil {
+			var count uint32
+			if dc.GetCount(&count) == nil {
+				for i := uint32(0); i < count; i++ {
+					var dev *wca.IMMDevice
+					if err := dc.Item(i, &dev); err != nil {
+						continue
+					}
+					var aev *wca.IAudioEndpointVolume
+					if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err != nil {
+						dev.Release()
+						continue
+					}
+					dev.Release()
+					hr, _, _ := syscall.Syscall(
+						aev.VTable().RegisterControlChangeNotify,
+						2,
+						uintptr(unsafe.Pointer(aev)),
+						uintptr(unsafe.Pointer(sf.micMuteCallback)),
+						0)
+					if hr != 0 {
+						aev.Release()
+						continue
+					}
+					sf.captureAevs = append(sf.captureAevs, aev)
+				}
+			}
+			dc.Release()
+		}
 	}
+	sf.captureAevsMu.Unlock()
 
 	// Push the updated aggregate state (using the same enumerator, already on this COM-initialized thread).
 	muted, err := queryCaptureAllMuted(de, sf.logger)

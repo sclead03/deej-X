@@ -57,6 +57,12 @@ type wcaSessionFinder struct {
 	// writing this slice, as both callers run on different goroutines.
 	captureAevsMu sync.Mutex
 	captureAevs   []*wca.IAudioEndpointVolume
+
+	// micMuteSuppressCheck, if set, is called at the start of handleMicMuteNotification
+	// before the expensive allCaptureDevicesMuted query. Returns true when the
+	// notification is a self-triggered echo of a button press and should be skipped.
+	// Wired up by session_map.go's setupMicMuteWatcher via SetMicMuteSuppressCheck.
+	micMuteSuppressCheck func() bool
 }
 
 const (
@@ -94,6 +100,14 @@ func (sf *wcaSessionFinder) SubscribeToMasterVolumeChanges() <-chan MasterVolume
 // SubscribeToMicMuteChanges implements MicMuteWatcher.
 func (sf *wcaSessionFinder) SubscribeToMicMuteChanges() <-chan bool {
 	return sf.micMuteChanges
+}
+
+// SetMicMuteSuppressCheck registers a function that returns true when a WASAPI
+// mic mute notification should be skipped without querying the aggregate — i.e.
+// the notification is an echo of a button press, not an external OS change.
+// Called from session_map.go's setupMicMuteWatcher.
+func (sf *wcaSessionFinder) SetMicMuteSuppressCheck(f func() bool) {
+	sf.micMuteSuppressCheck = f
 }
 
 func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
@@ -883,6 +897,16 @@ func (sf *wcaSessionFinder) micMuteNotifyCallback(this uintptr, pNotify *audioVo
 func (sf *wcaSessionFinder) handleMicMuteNotification(pNotify audioVolumeNotificationData) {
 	sf.logger.Debugw("Mic mute notify callback fired", "deviceMuted", pNotify.BMuted != 0)
 
+	// Skip the expensive aggregate query when this notification is a self-triggered
+	// echo of a button press — applyMicMuteAction already reads back and pushes the
+	// authoritative state via Path A (hid.go IsMuted → SendMicMuteState). Running
+	// allCaptureDevicesMuted here would be wasted work; the result gets suppressed
+	// downstream anyway by session_map's micMuteRecentlySetByButton check.
+	if sf.micMuteSuppressCheck != nil && sf.micMuteSuppressCheck() {
+		sf.logger.Debug("Mic mute notify: suppressing echo of button press, skipping aggregate query")
+		return
+	}
+
 	muted, err := sf.allCaptureDevicesMuted()
 	if err != nil {
 		sf.logger.Warnw("Failed to query all-capture-muted aggregate, using notified value", "error", err)
@@ -913,6 +937,7 @@ func (sf *wcaSessionFinder) deviceStateChangedCallback(
 	pwstrDeviceId uintptr,
 	dwNewState uint32,
 ) (hResult uintptr) {
+	sf.logger.Debugw("Device state changed callback fired", "newState", dwNewState)
 	go sf.handleDeviceStateChanged()
 	return
 }
@@ -996,6 +1021,7 @@ func (sf *wcaSessionFinder) handleDeviceStateChanged() {
 			dc.Release()
 		}
 	}
+	sf.logger.Debugw("Rebuilt captureAevs after device state change", "registered", len(sf.captureAevs))
 	sf.captureAevsMu.Unlock()
 
 	// Push the updated aggregate state (using the same enumerator, already on this COM-initialized thread).

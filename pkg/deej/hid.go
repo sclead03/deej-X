@@ -77,22 +77,32 @@ func (h *HIDManager) Stop() {
 }
 
 // IsMicMuted returns the current mic mute state. Uses the tracked state if a
-// button press or external change has been observed; otherwise queries the
-// default capture device (connect-time init path).
+// button press or external change has been observed; otherwise queries the OS
+// and caches the result so subsequent calls don't re-query.
 func (h *HIDManager) IsMicMuted() (bool, error) {
 	h.stateMu.Lock()
 	known, muted := h.currentMutedKnown, h.currentMuted
 	h.stateMu.Unlock()
 	if known {
+		h.logger.Debugw("IsMicMuted: cache hit", "muted", muted)
 		return muted, nil
 	}
-	return h.muter.IsMuted()
+	h.logger.Debug("IsMicMuted: state unknown, querying OS")
+	result, err := h.muter.IsMuted()
+	if err == nil {
+		h.stateMu.Lock()
+		h.currentMuted = result
+		h.currentMutedKnown = true
+		h.stateMu.Unlock()
+	}
+	return result, err
 }
 
 // SetCurrentMuteState records an externally-observed mic mute state change
 // (e.g. from the Windows volume mixer) so that the next button press
 // correctly toggles from the real current state rather than a stale one.
 func (h *HIDManager) SetCurrentMuteState(muted bool) {
+	h.logger.Debugw("SetCurrentMuteState: external update", "muted", muted)
 	h.stateMu.Lock()
 	h.currentMuted = muted
 	h.currentMutedKnown = true
@@ -228,6 +238,15 @@ func (h *HIDManager) handleReport(report []byte) {
 		return
 	}
 
+	// Break the host→firmware→host feedback loop: applyMicMuteAction calls
+	// SendMicMuteState, which causes SERENITY to echo a HID report back.
+	// markMicMuteSetByButton is called at the start of applyMicMuteAction, so
+	// any echo arriving within the suppress window is dropped here.
+	if h.deej.sessions.micMuteRecentlySetByButton(micMuteEchoSuppressWindow) {
+		h.logger.Debug("handleReport: suppressing echo within suppress window")
+		return
+	}
+
 	h.logger.Debug("Received mic-mute HID report")
 
 	switch h.deej.config.RGBButtonAction {
@@ -235,16 +254,17 @@ func (h *HIDManager) handleReport(report []byte) {
 		h.applyMicMuteAction(true)
 	case "unmute_mic":
 		h.applyMicMuteAction(false)
-	case "masterVol_mute":
+	case "mastervol_mute":
 		h.deej.display.handleMasterMuteToggleRequest()
 	default: // "mic_mute_toggle"
-		// Toggle from the last known state; query the OS if we haven't seen a
-		// change yet so we start in the right direction.
+		// Toggle from the last known state; use IsMicMuted so the result is
+		// cached and shared with any concurrent caller (e.g. pushMasterState).
 		h.stateMu.Lock()
 		known := h.currentMutedKnown
 		h.stateMu.Unlock()
 		if !known {
-			if queried, err := h.muter.IsMuted(); err == nil {
+			h.logger.Debug("handleReport: initial state unknown, querying OS before toggle")
+			if queried, err := h.IsMicMuted(); err == nil {
 				h.stateMu.Lock()
 				h.currentMuted = queried
 				h.currentMutedKnown = true

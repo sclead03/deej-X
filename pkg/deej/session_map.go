@@ -273,6 +273,19 @@ func (m *sessionMap) setupMasterVolumeWatcher(watcher MasterVolumeWatcher) {
 func (m *sessionMap) setupMicMuteWatcher(watcher MicMuteWatcher) {
 	changes := watcher.SubscribeToMicMuteChanges()
 
+	// If the watcher supports early suppression, register the check so it can skip
+	// the expensive allCaptureDevicesMuted query for button-press echoes before they
+	// are even queued. The session_map check below remains as a belt-and-suspenders
+	// fallback for watchers that don't implement SetMicMuteSuppressCheck (e.g. Linux).
+	type suppressSetter interface {
+		SetMicMuteSuppressCheck(func() bool)
+	}
+	if setter, ok := watcher.(suppressSetter); ok {
+		setter.SetMicMuteSuppressCheck(func() bool {
+			return m.micMuteRecentlySetByButton(micMuteEchoSuppressWindow)
+		})
+	}
+
 	go func() {
 		for muted := range changes {
 			if m.micMuteRecentlySetByButton(micMuteEchoSuppressWindow) {

@@ -13,32 +13,40 @@ import (
 const (
 	buildTypeNone    = ""
 	buildTypeDev     = "dev"
+	buildTypeDebug   = "debug"
 	buildTypeRelease = "release"
 
 	logDirectory = "logs"
-	logFilename  = "deej-latest-run.log"
 )
 
 // NewLogger provides a logger instance for the whole program
 func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 	var loggerConfig zap.Config
 
-	// release: info and above, log to file only (no UI)
-	if buildType == buildTypeRelease {
+	ts := time.Now().Format("2006-01-02_15-04-05")
+
+	switch buildType {
+	case buildTypeRelease:
+		// info and above, log to file only
 		if err := util.EnsureDirExists(logDirectory); err != nil {
 			return nil, fmt.Errorf("ensure log directory exists: %w", err)
 		}
-
 		loggerConfig = zap.NewProductionConfig()
-
-		loggerConfig.OutputPaths = []string{filepath.Join(logDirectory, logFilename)}
+		loggerConfig.OutputPaths = []string{filepath.Join(logDirectory, fmt.Sprintf("deej-%s.log", ts))}
 		loggerConfig.Encoding = "console"
 
-		// development: debug and above, log to stderr only, colorful
-	} else {
+	case buildTypeDebug:
+		// debug and above, log to file (no color — file-safe)
+		if err := util.EnsureDirExists(logDirectory); err != nil {
+			return nil, fmt.Errorf("ensure log directory exists: %w", err)
+		}
 		loggerConfig = zap.NewDevelopmentConfig()
+		loggerConfig.OutputPaths = []string{filepath.Join(logDirectory, fmt.Sprintf("deej-debug-%s.log", ts))}
+		loggerConfig.EncoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
 
-		// make it colorful
+	default:
+		// development: debug and above, log to stderr, colorful
+		loggerConfig = zap.NewDevelopmentConfig()
 		loggerConfig.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	}
 

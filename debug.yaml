@@ -1,0 +1,6 @@
+# Debug build run configuration
+# run_duration_ms: how long to run before auto-exiting
+#   0 = run until manually terminated (tray quit or Ctrl+C)
+#   any positive value = exit after that many milliseconds
+run_duration_ms: 0
+

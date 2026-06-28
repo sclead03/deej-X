@@ -244,6 +244,10 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator, logger *zap.SugaredLogger
 		return false, fmt.Errorf("get device count: %w", err)
 	}
 
+	if logger != nil {
+		logger.Debugw("queryCaptureAllMuted: device count", "count", count)
+	}
+
 	if count == 0 {
 		if logger != nil {
 			logger.Debugw("queryCaptureAllMuted: no active capture devices")
@@ -252,8 +256,14 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator, logger *zap.SugaredLogger
 	}
 
 	for i := uint32(0); i < count; i++ {
+		if logger != nil {
+			logger.Debugw("queryCaptureAllMuted: loop iteration", "i", i, "count", count)
+		}
 		var dev *wca.IMMDevice
 		if err := dc.Item(i, &dev); err != nil {
+			if logger != nil {
+				logger.Debugw("queryCaptureAllMuted: Item failed", "i", i, "error", err)
+			}
 			continue
 		}
 
@@ -273,8 +283,10 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator, logger *zap.SugaredLogger
 			continue
 		}
 
-		var muted bool
-		getMuteErr := aev.GetMute(&muted)
+		// Use uint32 (Windows BOOL = int32, 4 bytes) not bool (1 byte) — COM's
+		// GetMute(BOOL*) writes 4 bytes; passing *bool corrupts adjacent stack memory.
+		var mutedBOOL uint32
+		getMuteErr := aev.GetMute((*bool)(unsafe.Pointer(&mutedBOOL)))
 		aev.Release()
 		dev.Release()
 
@@ -285,9 +297,9 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator, logger *zap.SugaredLogger
 			continue
 		}
 		if logger != nil {
-			logger.Debugw("GetMute result", "deviceIdx", i, "device", friendlyName, "muted", muted)
+			logger.Debugw("GetMute result", "deviceIdx", i, "device", friendlyName, "muted", mutedBOOL != 0)
 		}
-		if !muted {
+		if mutedBOOL == 0 {
 			return false, nil
 		}
 	}
@@ -387,11 +399,23 @@ func (m *windowsMicMuter) applyToDevices(muted bool, targets []string) error {
 		if matches {
 			var aev *wca.IAudioEndpointVolume
 			if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err == nil {
-				if err := aev.SetMute(muted, nil); err == nil {
+				// Pre-check current state: some drivers return "Incorrect function."
+				// when SetMute is called with the state the device is already in,
+				// rather than no-op'ing the call. Skip SetMute in that case.
+				skip := false
+				var currentMutedBOOL uint32
+				if aev.GetMute((*bool)(unsafe.Pointer(&currentMutedBOOL))) == nil && (currentMutedBOOL != 0) == muted {
+					skip = true
 					applied++
-					m.logger.Debugw("SetMute succeeded", "deviceIdx", i, "device", friendlyName, "muted", muted)
-				} else {
-					m.logger.Debugw("SetMute failed", "deviceIdx", i, "device", friendlyName, "muted", muted, "error", err)
+					m.logger.Debugw("SetMute skipped, already in desired state", "deviceIdx", i, "device", friendlyName, "muted", muted)
+				}
+				if !skip {
+					if err := aev.SetMute(muted, nil); err == nil {
+						applied++
+						m.logger.Debugw("SetMute succeeded", "deviceIdx", i, "device", friendlyName, "muted", muted)
+					} else {
+						m.logger.Debugw("SetMute failed", "deviceIdx", i, "device", friendlyName, "muted", muted, "error", err)
+					}
 				}
 				aev.Release()
 			} else {

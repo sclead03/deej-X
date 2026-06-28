@@ -53,6 +53,7 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `icon_dir` | ✓ implemented | Directory containing PNG icon files; relative or absolute path |
 | `icon_conversion` | pending removal | See "Remove Dithering Support" in Remaining Work |
 | `d16_button.action` | ✓ implemented | Action for D16 (PF7) button press. Same values as encoder gesture actions: `masterVol_mute`, `play_pause`, `skip_forward`, `skip_back`, `mute_mic`, `unmute_mic`. Default `masterVol_mute`. |
+| `newInput_behavior` | pending | `mute` or `unmute`. On startup and whenever a new input device connects, immediately enforce this state on all connected input devices. Not yet implemented. |
 
 ---
 
@@ -176,6 +177,18 @@ go build -ldflags "-H=windowsgui -X main.buildType=release" -o deej-x.exe ./pkg/
 - Before rebuilding, stop any running `deej-x.exe` process first (file is locked while running).
 - For local debugging where you want live stderr output instead of the release log file, use `go run ./pkg/deej/cmd` (optionally with `-v`/`--verbose`) instead of building — don't pass `-H=windowsgui` for that case, since you want the console.
 
+**Debug build (`deej-x_debug.exe`):**
+
+`deej-x_debug.exe` is pre-built and present in the project directory — do not rebuild it at the start of a debug session unless code has changed. To rebuild:
+
+```
+go build -ldflags "-X main.buildType=debug" -o deej-x_debug.exe ./pkg/deej/cmd
+```
+
+Logs at DEBUG level to `logs/deej-debug-<timestamp>.log`. Controlled by `debug.yaml` in the working directory:
+- `run_duration_ms: 0` — run until manually terminated (required for manual test sessions; set to 0 before debugging)
+- `run_duration_ms: N` — auto-exit after N ms (useful for quick smoke tests)
+
 ## Codebase Structure
 
 ```
@@ -252,19 +265,29 @@ Real WASAPI mute on the master output, mirroring how mic mute works. Implemented
 
 **Still needed:** bench verify encoder mute/unmute restores the real level, external Windows-mixer mute/unmute still works, and rapid repeated clicks don't desync `volMuted` from WASAPI state.
 
-### Global Mic Mute (mute all inputs, unmute one) — NOT DESIGNED
+### Global Mic Mute — IMPLEMENTED, BUG UNDER INVESTIGATION
 
-Current mic mute only touches the OS default capture device. Desired behavior:
-- **Mute** → every active input device (`IMMDeviceEnumerator.EnumAudioEndpoints(ECapture, DEVICE_STATE_ACTIVE, ...)`)
-- **Unmute** → one specific configured device by friendly name only (asymmetric by design)
-- Host must track an explicit "intended" state so hotplugged devices inherit it
-- **Do not implement the partial-state icon** (mic+slash+exclamation) until the definition of "partial" is resolved — see firmware CLAUDE.md "RGB button mic mute"
-- Config shape (proposed, not finalized):
-  ```yaml
-  mic_mute:
-    mute_target: input.global
-    unmute_target: "USB Microphone"
-  ```
+Multi-device mute infrastructure is implemented but nonfunctional in practice (see "Active Bugs").
+
+**Canonical behavior spec (source of truth):**
+- `mute.all` must enforce mute on every connected input device, regardless of each device's prior state — no reliance on stored/assumed state.
+- `unmute.all` must enforce unmute on every connected input device, regardless of prior state.
+- SERENITY shows **muted** only when ALL active input devices are muted.
+- SERENITY shows **unmuted** if ANY active input device is unmuted; not all need to be unmuted simultaneously.
+- State changes are pushed to SERENITY only when the aggregate (all-muted) status changes. Individual device changes that do not change the aggregate must not generate a push. (Currently `handleExternalMicMuteChange` in `display.go` has no dedup — it pushes on every notification regardless of whether the aggregate actually changed. Needs a last-pushed cache, same pattern as master volume.)
+- `newInput_behavior` config key (`mute`/`unmute`, not yet implemented): on startup, apply this state to all currently connected input devices; whenever a new input device connects, immediately apply it.
+
+**What is implemented:**
+- `windowsMicMuter.applyToDevices()` (`hid_windows.go`) enumerates all active capture devices via a fresh `IMMDeviceEnumerator` each call and calls `SetMute` unconditionally on each matching target — satisfies the "regardless of previous state" requirement.
+- Default `MuteAction`/`UnmuteAction` is `["mute.all"]`/`["unmute.all"]` — sentinels that hit every device.
+- `queryCaptureAllMuted()` (`hid_windows.go` + `session_finder_windows.go`) returns true only if every active device is muted — satisfies the aggregate logic.
+- `deviceStateChangedCallback` → `handleDeviceStateChanged()` (`session_finder_windows.go`) fires on device state transitions; rebuilds `captureAevs`, re-registers `micMuteCallback` on all current active devices, pushes updated aggregate to `micMuteChanges`.
+- `HIDManager.currentMuted` cache is updated by `handleExternalMicMuteChange()` so the next button press toggles from the correct state.
+
+**What is NOT YET IMPLEMENTED (separate from the bug):**
+- `newInput_behavior` config key (startup + hotplug enforcement).
+- Aggregate push dedup in `handleExternalMicMuteChange` (individual device changes should not send redundant pushes to SERENITY).
+- Do not implement the partial-state icon until "partial" definition is resolved — see firmware CLAUDE.md "RGB button mic mute".
 
 ### Linux HID Enumeration
 
@@ -291,6 +314,65 @@ In `channel_icon.go`: drop `applyFloydSteinberg`/`applyFloydSteinbergAlpha`, col
 ### Soft Takeover — NOT DESIGNED
 
 Move takeover logic to host (currently firmware-only for per-channel mute) and extend to connect-time: faders 1–5 currently snap-jump on connect; could freeze at app setpoint until the physical fader crosses it. Open: exact protocol changes needed, multi-session slider target resolution, whether this replaces snap-jump outright or is config-gated.
+
+---
+
+## Active Bugs
+
+### Multi-device mic mute nonfunctional
+
+**Symptom:** Mic mute behavior breaks when more than one input device is connected. Exact failure mode not yet characterized — debug session in progress.
+
+**Code paths under investigation** (verified line numbers as of 2026-06-28 — check git blame if refactored):
+- `hid_windows.go:318` `applyToDevices()` — creates fresh enumerator, iterates all active capture devices, calls `SetMute`; logs "applyToDevices start/done" with total count
+- `hid_windows.go:432` `IsMuted()` — creates fresh enumerator, delegates to `queryCaptureAllMuted()`; logs "IsMuted aggregate result"
+- `hid_windows.go:235` `queryCaptureAllMuted()` — iterates all active capture devices, returns true only if every one is muted; logs per-device GetMute results
+- `session_finder_windows.go:752` `registerMicMuteChangeCallback()` — (re)builds `captureAevs` slice under `captureAevsMu`, registers `micMuteCallback` on all active capture devices; logs "Registered mic mute change callbacks on capture devices registered=N total=N"
+- `session_finder_windows.go:911` `deviceStateChangedCallback()` → `session_finder_windows.go:928` `handleDeviceStateChanged()` — hotplug handler; fully rebuilds `captureAevs` under `captureAevsMu`, re-registers callbacks, pushes updated aggregate; logs "Device state changed, pushing updated aggregate allMuted=..."
+- `session_finder_windows.go:872` `micMuteNotifyCallback()` → `session_finder_windows.go:883` `handleMicMuteNotification()` — fires on any registered device's mute change; re-queries full aggregate via `allCaptureDevicesMuted()`; logs "Mic mute notify callback fired" and "Mic mute aggregate computed"
+- `session_map.go`: `setupMicMuteWatcher()` — forwards aggregate changes from `sf.micMuteChanges` to consumers; `micMuteRecentlySetByButton()` suppression window (500ms) can block legitimate second-device notifications
+- `display.go`: `handleExternalMicMuteChange()` — pushes aggregate to SERENITY and updates `HIDManager` cache; currently no dedup — pushes on every notification regardless of whether aggregate changed (known gap)
+
+**Debug session setup:**
+1. Ensure `debug.yaml` has `run_duration_ms: 0` (already set — verified 2026-06-28).
+2. Run `deej-x_debug.exe` from the project directory (pre-built; no rebuild needed unless code changed); log appears in `logs/deej-debug-<timestamp>.log`.
+3. Test sequence: single device → confirm mute works → plug in second device → confirm/deny device-change callback fired → test mute again.
+
+**Key log lines to watch (by stage):**
+
+*Startup / single device:*
+```
+session_finder        Registered mic mute change callbacks on capture devices  registered=1 total=1
+```
+
+*Button press with 1 device (baseline):*
+```
+hid.mic_muter         applyToDevices start  muted=true ... total=1
+hid.mic_muter         SetMute succeeded  deviceIdx=0 device="<name>" muted=true
+hid.mic_muter         applyToDevices done  applied=1 total=1
+hid                   Pushed mic mute state  muted=true
+```
+
+*After plugging in second device — must see all three:*
+```
+session_finder        Device state changed, pushing updated aggregate  allMuted=false
+```
+*(and from handleDeviceStateChanged's inline rebuild — note: this does NOT log "Registered mic mute change callbacks"; check captureAevs count indirectly via subsequent button press behavior)*
+
+*Button press with 2 devices — what we expect vs. what may actually happen:*
+```
+hid.mic_muter         applyToDevices start  muted=true ... total=2      ← must be 2
+hid.mic_muter         SetMute succeeded  deviceIdx=0 ...
+hid.mic_muter         SetMute succeeded  deviceIdx=1 ...
+hid.mic_muter         applyToDevices done  applied=2 total=2            ← both must apply
+hid.mic_muter         IsMuted aggregate result  allMuted=true
+```
+
+**Suspected failure points (not yet confirmed):**
+- `deviceStateChangedCallback` may not fire reliably for USB device arrival (vs. default-device change). Absence of the "Device state changed" log confirms this.
+- `handleDeviceStateChanged` may find 0 or 1 devices if the device hasn't reached `DEVICE_STATE_ACTIVE` by the time the goroutine enumerates — timing race on USB enumeration.
+- `applyToDevices` total=1 despite 2 devices being present would indicate its fresh enumerator isn't seeing the new device; would suggest it's being called before OS audio stack registers the device.
+- Suppression window (`micMuteRecentlySetByButton`, 500ms) incorrectly blocking a legitimate second-device notification is a lower-probability but possible cause.
 
 ---
 

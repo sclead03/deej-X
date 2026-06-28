@@ -1,8 +1,0 @@
-Input device mute behavior:
-- mute.all should enforce mute on all connected input devices, regardless of previous state
-- unmute.all should enfoce unmute on all connected input devices, regardless of previous state
-- mute.all and unmute.all should verify and appropriately set every connected input device when triggered, not rely on previous stored/assumed state
-- 'mute' status is shown on SERENITY *only when ALL devices are muted*
-- 'unmute' status is shown on SERENITY if *ANY* device is unmuted; does not require all devices to be simultaneously unmuted
-- deej-x.exe should track OS-level mute status of all connected input devices. mute/unmute status flags are sent to SERENITY only if mute/unmute ALL status changes - i.e. no triggers sent to SERENITY for individual device change that does not change the total aggregate status
-- the config.yaml for deej-x should have a variable added (not yet implemented) newInput_behavior - this should allow 'mute' or 'unmute' options only. If deej-x.exe is running when a new input device is connected, that input device should immediately be configured to this state. When deej-x is launched, all input devices currently connected should be configured to this state.

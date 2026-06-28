@@ -3,8 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/sclead03/deej-x/pkg/deej"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -57,6 +60,33 @@ func main() {
 
 		versionString := fmt.Sprintf("Version %s-%s", buildType, identifier)
 		d.SetVersion(versionString)
+	}
+
+	// Debug builds: read debug.yaml for run duration, default 100ms.
+	// run_duration_ms: 0 means run until manually terminated.
+	if buildType == "debug" {
+		runMs := 100
+		type debugConfig struct {
+			RunDurationMs int `yaml:"run_duration_ms"`
+		}
+		if data, err := os.ReadFile("debug.yaml"); err == nil {
+			var cfg debugConfig
+			if err := yaml.Unmarshal(data, &cfg); err == nil {
+				runMs = cfg.RunDurationMs
+			} else {
+				named.Warnw("Failed to parse debug.yaml, using default 100ms", "error", err)
+			}
+		}
+		if runMs > 0 {
+			go func() {
+				time.Sleep(time.Duration(runMs) * time.Millisecond)
+				named.Infof("Debug build: auto-exiting after %dms", runMs)
+				logger.Sync()
+				os.Exit(0)
+			}()
+		} else {
+			named.Info("Debug build: run_duration_ms=0, running until terminated")
+		}
 	}
 
 	// onwards, to glory

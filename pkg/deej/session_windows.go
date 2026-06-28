@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unsafe"
 
 	ole "github.com/go-ole/go-ole"
 	ps "github.com/mitchellh/go-ps"
@@ -187,13 +188,15 @@ func (s *masterSession) SetVolume(v float32) error {
 // (BMuted). Used via the optional muteGetter/muteToggler interfaces in
 // sessionMap.getMasterMuted/toggleMasterMuted.
 func (s *masterSession) GetMuted() (bool, error) {
-	var muted bool
-	if err := s.volume.GetMute(&muted); err != nil {
+	// Use uint32 (Windows BOOL = int32, 4 bytes) not bool (1 byte) — same fix as
+	// queryCaptureAllMuted; COM's GetMute(BOOL*) writes 4 bytes to our pointer.
+	var mutedBOOL uint32
+	if err := s.volume.GetMute((*bool)(unsafe.Pointer(&mutedBOOL))); err != nil {
 		s.logger.Warnw("Failed to get session mute state", "error", err)
 		return false, fmt.Errorf("get session mute state: %w", err)
 	}
 
-	return muted, nil
+	return mutedBOOL != 0, nil
 }
 
 // SetMuted sets the master output session's real WASAPI mute state, tagged

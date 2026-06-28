@@ -32,8 +32,8 @@ const (
 )
 
 var gestureActionByName = map[string]byte{
-	"masterVol_mute": GestureActionMasterMute,
-	"play_pause":   GestureActionPlayPause,
+	"mastervol_mute": GestureActionMasterMute,
+	"play_pause":     GestureActionPlayPause,
 	"skip_forward": GestureActionSkipForward,
 	"skip_back":    GestureActionSkipBack,
 	"mute_mic":   GestureActionMicMute,
@@ -426,7 +426,7 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		action = rgbButtonActionDefault
 	}
 	switch action {
-	case "mic_mute_toggle", "mute_mic", "unmute_mic", "masterVol_mute":
+	case "mic_mute_toggle", "mute_mic", "unmute_mic", "mastervol_mute":
 		cc.RGBButtonAction = action
 	default:
 		cc.logger.Warnw("Unknown rgb_button action, using default", "action", action)

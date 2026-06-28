@@ -345,6 +345,7 @@ func (dm *DisplayManager) pushMasterState(writer *SerialWriter) {
 		dm.logger.Debug("Master session not available, skipping master volume push")
 	}
 
+	dm.logger.Debug("pushMasterState: querying mic mute state")
 	if muted, err := dm.deej.hid.IsMicMuted(); err != nil {
 		dm.logger.Debugw("Failed to get mic mute state, skipping push", "error", err)
 	} else if err := writer.SendMicMuteState(muted); err != nil {

@@ -81,6 +81,34 @@ func NormalizeScalar(v float32) float32 {
 	return float32(math.Floor(float64(v)*100) / 100.0)
 }
 
+// Volume curve shapes supported by ApplyVolumeCurve
+const (
+	VolumeCurveLinear = "linear"
+	VolumeCurveLog    = "log"
+)
+
+// ApplyVolumeCurve reshapes a raw linear slider fraction (0.0-1.0, where 1.0 means
+// physically all the way up) into the volume scalar that should be sent to Windows.
+// "linear" passes the fraction through unchanged. "log" treats the fraction as a
+// straight-line position between dbFloor (fully down) and 0dB (fully up, unity gain),
+// then converts that dB value into a linear amplitude scalar - so a physical inch of
+// slider travel maps to an even step in perceived loudness rather than an even step
+// in raw amplitude. True 0 (the caller's own deadzone should be what produces an exact
+// 0.0 at the physical bottom, not this function) always maps to true silence, regardless
+// of dbFloor - the dB math alone would otherwise produce a small-but-nonzero scalar there.
+func ApplyVolumeCurve(linear float32, curve string, dbFloor float64) float32 {
+	if curve != VolumeCurveLog {
+		return linear
+	}
+
+	if linear <= 0 {
+		return 0
+	}
+
+	db := dbFloor * (1 - float64(linear))
+	return float32(math.Pow(10, db/20))
+}
+
 // SignificantlyDifferent returns true if there's a significant enough volume difference between two given values
 func SignificantlyDifferent(old float32, new float32, noiseReductionLevel string) bool {
 

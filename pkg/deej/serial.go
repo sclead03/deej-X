@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,8 +30,8 @@ type SerialIO struct {
 	connOptions serial.OpenOptions
 	conn        io.ReadWriteCloser
 
-	lastKnownNumSliders        int
-	currentSliderPercentValues []float32
+	lastKnownNumSliders   int
+	currentSliderPositions []float32
 
 	sliderMoveConsumers []chan SliderMoveEvent
 	connectedConsumers  []chan struct{}
@@ -392,11 +393,11 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 	if numSliders != sio.lastKnownNumSliders {
 		logger.Infow("Detected sliders", "amount", numSliders)
 		sio.lastKnownNumSliders = numSliders
-		sio.currentSliderPercentValues = make([]float32, numSliders)
+		sio.currentSliderPositions = make([]float32, numSliders)
 
 		// reset everything to be an impossible value to force the slider move event later
-		for idx := range sio.currentSliderPercentValues {
-			sio.currentSliderPercentValues[idx] = -1.0
+		for idx := range sio.currentSliderPositions {
+			sio.currentSliderPositions[idx] = -1.0
 		}
 	}
 
@@ -425,26 +426,45 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 			return
 		}
 
+		// physical potentiometers rarely land on an exact rail even when fully bottomed or
+		// topped out. Snap raw readings within the configured deadzone of either physical
+		// extreme to the true endpoint. This has to happen here, on the raw 0-1023 reading,
+		// before any inversion or curve/dB math - that's what makes "physically bottomed
+		// out" reliably mean true 0 no matter what volume curve or dB floor is configured.
+		// Skipped for slider 0 (the master encoder): it's not a physical potentiometer, and
+		// snapping it here would corrupt the master-volume echo-detection check below,
+		// which compares this same raw value against the last value the host itself sent.
+		if sliderIdx != 0 {
+			deadzoneCounts := int(math.Round(sio.deej.config.FaderDeadzonePercent / 100.0 * 1023.0))
+			if number <= deadzoneCounts {
+				number = 0
+			} else if number >= 1023-deadzoneCounts {
+				number = 1023
+			}
+		}
+
 		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
 		dirtyFloat := float32(number) / 1023.0
 
-		// normalize it to an actual volume scalar between 0.0 and 1.0 with 2 points of precision
-		normalizedScalar := util.NormalizeScalar(dirtyFloat)
-
-		// if sliders are inverted, take the complement of 1.0
+		// if sliders are inverted, take the complement of 1.0 - this has to happen before
+		// the volume curve below so the curve is always shaped relative to "slider all the way up"
 		if sio.deej.config.InvertSliders {
-			normalizedScalar = 1 - normalizedScalar
+			dirtyFloat = 1 - dirtyFloat
 		}
 
-		// check if it changes the desired state (could just be a jumpy raw slider value)
-		if util.SignificantlyDifferent(sio.currentSliderPercentValues[sliderIdx], normalizedScalar, sio.deej.config.NoiseReductionLevel) {
+		// check if the physical position moved enough to count as a real slider move (as
+		// opposed to sensor noise) - this has to be judged on raw position, not on the
+		// curved volume value below, since the curve can be far steeper in some parts of
+		// its range than others; gating on the curved output would make the same physical
+		// movement register very differently depending on where the slider happens to be
+		if util.SignificantlyDifferent(sio.currentSliderPositions[sliderIdx], dirtyFloat, sio.deej.config.NoiseReductionLevel) {
 
 			// slider 0 is SERENITY's master volume encoder, not a physical-position slider -
 			// its value on the very first read is just whatever masterVol the firmware booted
 			// with, not a real user-set position. Applying it would stomp the actual Windows
 			// volume right as pushMasterState is trying to sync the real value down. Prime the
 			// baseline silently here and let the encoder/pushMasterState drive it from now on.
-			primingMasterSlider := sliderIdx == 0 && sio.currentSliderPercentValues[sliderIdx] < 0
+			primingMasterSlider := sliderIdx == 0 && sio.currentSliderPositions[sliderIdx] < 0
 
 			// slider 0 is also a live-volume push target (SET_MASTER_VOLUME) - SERENITY
 			// echoes its current masterVol back on every regular line, so a value we
@@ -473,13 +493,17 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 				}
 			}
 
-			// if it does, update the saved value and create a move event
-			sio.currentSliderPercentValues[sliderIdx] = normalizedScalar
+			// if it does, update the saved position and create a move event using the
+			// freshly curved volume value at full precision (not rounded to a coarse
+			// grid - a wide dB range needs far more than ~100 steps to stay smooth)
+			sio.currentSliderPositions[sliderIdx] = dirtyFloat
 
 			if !primingMasterSlider && !isMasterVolumeEcho {
+				curvedScalar := util.ApplyVolumeCurve(dirtyFloat, sio.deej.config.VolumeCurve, sio.deej.config.VolumeCurveDbFloor)
+
 				moveEvents = append(moveEvents, SliderMoveEvent{
 					SliderID:     sliderIdx,
-					PercentValue: normalizedScalar,
+					PercentValue: curvedScalar,
 				})
 
 				if sio.deej.Verbose() {

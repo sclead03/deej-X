@@ -67,9 +67,12 @@ type CanonicalConfig struct {
 
 	InvertSliders       bool
 	NoiseReductionLevel string
+	VolumeCurve         string
+	VolumeCurveDbFloor  float64
 	NumSliders          int
 	DisplayGapPixels    int
 	FaderOrder          []int
+	FaderDeadzonePercent float64
 	MasterLabel         string
 	ChannelNames        [numChannels]string
 	IconDir             string
@@ -106,7 +109,10 @@ const (
 	configKeyCOMPort             = "com_port"
 	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
+	configKeyVolumeCurve         = "volume_curve"
+	configKeyVolumeCurveDbFloor  = "volume_curve_db_floor"
 	configKeyFaderOrder        = "fader_order"
+	configKeyFaderDeadzonePercent = "fader_deadzone_percent"
 	configKeyChannelNames      = "channel_names"
 	configKeyIconDir           = "icon_dir"
 	configKeyMicMuteMuteAction     = "mic_mute.mute_action"
@@ -132,6 +138,15 @@ const (
 	defaultEncoderClickWindowMs = 250
 	minEncoderClickWindowMs     = 50
 	maxEncoderClickWindowMs     = 1000
+
+	defaultVolumeCurve        = util.VolumeCurveLinear
+	defaultVolumeCurveDbFloor = -60.0
+	minVolumeCurveDbFloor     = -120.0
+	maxVolumeCurveDbFloor     = -1.0
+
+	defaultFaderDeadzonePercent = 1.0
+	minFaderDeadzonePercent     = 0.0
+	maxFaderDeadzonePercent     = 25.0
 
 	// rgbButtonActionDefault is the default RGB button action — toggle mic mute,
 	// preserving the original hardcoded behaviour.
@@ -234,6 +249,8 @@ func (cc *CanonicalConfig) Load() error {
 		"sliderMapping", cc.SliderMapping,
 		"connectionInfo", cc.ConnectionInfo,
 		"invertSliders", cc.InvertSliders,
+		"volumeCurve", cc.VolumeCurve,
+		"volumeCurveDbFloor", cc.VolumeCurveDbFloor,
 		"masterLabel", cc.MasterLabel,
 		"channelNames", cc.ChannelNames,
 		"iconDir", cc.IconDir,
@@ -330,6 +347,34 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
 
+	curve := strings.ToLower(strings.TrimSpace(cc.userConfig.GetString(configKeyVolumeCurve)))
+	switch curve {
+	case "", util.VolumeCurveLinear:
+		cc.VolumeCurve = util.VolumeCurveLinear
+	case util.VolumeCurveLog:
+		cc.VolumeCurve = util.VolumeCurveLog
+	default:
+		cc.logger.Warnw("Unknown volume_curve, using default",
+			"value", curve,
+			"default", defaultVolumeCurve)
+		cc.VolumeCurve = defaultVolumeCurve
+	}
+
+	if !cc.userConfig.IsSet(configKeyVolumeCurveDbFloor) {
+		cc.VolumeCurveDbFloor = defaultVolumeCurveDbFloor
+	} else {
+		dbFloor := cc.userConfig.GetFloat64(configKeyVolumeCurveDbFloor)
+		if dbFloor < minVolumeCurveDbFloor || dbFloor > maxVolumeCurveDbFloor {
+			cc.logger.Warnw("volume_curve_db_floor out of range, using default",
+				"value", dbFloor,
+				"min", minVolumeCurveDbFloor,
+				"max", maxVolumeCurveDbFloor,
+				"default", defaultVolumeCurveDbFloor)
+			dbFloor = defaultVolumeCurveDbFloor
+		}
+		cc.VolumeCurveDbFloor = dbFloor
+	}
+
 	var numSliders int
 	if !cc.userConfig.IsSet(configKeyNumSliders) {
 		numSliders = defaultNumSliders
@@ -376,6 +421,21 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		}
 	} else {
 		cc.FaderOrder = nil
+	}
+
+	if !cc.userConfig.IsSet(configKeyFaderDeadzonePercent) {
+		cc.FaderDeadzonePercent = defaultFaderDeadzonePercent
+	} else {
+		deadzone := cc.userConfig.GetFloat64(configKeyFaderDeadzonePercent)
+		if deadzone < minFaderDeadzonePercent || deadzone > maxFaderDeadzonePercent {
+			cc.logger.Warnw("fader_deadzone_percent out of range, using default",
+				"value", deadzone,
+				"min", minFaderDeadzonePercent,
+				"max", maxFaderDeadzonePercent,
+				"default", defaultFaderDeadzonePercent)
+			deadzone = defaultFaderDeadzonePercent
+		}
+		cc.FaderDeadzonePercent = deadzone
 	}
 
 	// channel_names is a map: key "0" = master OLED label, keys "1"–"5" = fader OLED names

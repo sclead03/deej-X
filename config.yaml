@@ -27,6 +27,12 @@ fader_order: [0, 1, 2, 3, 4]
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false
 
+# physical faders rarely reach an exact 0 or 100% reading even fully bottomed/topped out.
+# raw readings within this percent of either physical extreme snap to the true endpoint,
+# so "fader all the way down" reliably means true 0 no matter what volume_curve/floor is
+# set. Does not apply to the master encoder (slot 0), which isn't a physical potentiometer.
+fader_deadzone_percent: 1
+
 # settings for connecting to SERENITY
 com_port: COM9
 baud_rate: 115200
@@ -34,6 +40,19 @@ baud_rate: 115200
 # adjust the amount of signal noise reduction depending on your hardware quality
 # supported values are "low" (excellent hardware), "default" (regular hardware) or "high" (bad, noisy hardware)
 noise_reduction: default
+
+# how a slider's physical position is converted into a volume value
+# "linear" - slider position maps straight to volume (default)
+# "log" - slider position maps to a dB value between volume_curve_db_floor and 0dB (full up),
+#         which is then converted to volume; matches how real mixing console faders feel,
+#         since human hearing perceives loudness on a logarithmic scale, not a linear one
+volume_curve: log
+
+# only used when volume_curve is "log" - the dB level treated as "fully down" on the slider
+# (0dB, unity gain, is always "fully up" and isn't configurable). -60 is the standard
+# convention for "practically silent" in audio engineering. Must be between -120 and -1
+# -20 
+volume_curve_db_floor: -40
 
 # directory containing PNG icon files for channel OLEDs; relative to deej-x.exe or absolute
 icon_dir: icons

@@ -51,7 +51,6 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `slider_mapping` | ✓ existing | 6-channel SERENITY layout in default config |
 | `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
 | `icon_dir` | ✓ implemented | Directory containing PNG icon files; relative or absolute path |
-| `icon_conversion` | pending removal | See "Remove Dithering Support" in Remaining Work |
 | `d16_button.action` | ✓ implemented | Action for D16 (PF7) button press. Same values as encoder gesture actions: `masterVol_mute`, `play_pause`, `skip_forward`, `skip_back`, `mute_mic`, `unmute_mic`. Default `masterVol_mute`. |
 | `newInput_behavior` | pending | `mute` or `unmute`. On startup and whenever a new input device connects, immediately enforce this state on all connected input devices. Not yet implemented. |
 
@@ -185,7 +184,7 @@ go build -ldflags "-H=windowsgui -X main.buildType=release" -o deej-x.exe ./pkg/
 go build -ldflags "-X main.buildType=debug" -o deej-x_debug.exe ./pkg/deej/cmd
 ```
 
-Logs at DEBUG level to `logs/deej-debug-<timestamp>.log`. Controlled by `debug.yaml` in the working directory:
+Logs at DEBUG level to both `logs/deej-debug-<timestamp>.log` and a visible console window (this build intentionally omits `-H=windowsgui` so a console exists; Ctrl+C in that window terminates the session). The two sinks aren't identical: `logger.go`'s `newDebugLogger()` tees a file core (untruncated) with a console core wrapped by `truncatingCore`, which caps long string fields (e.g. `serial_writer.go`'s hex-dumped TX/RX payloads — an icon push alone is 1500+ hex chars) at `consoleFieldTruncateLen` (120 chars) so the terminal doesn't get flooded; the log file always has the full value. Controlled by `debug.yaml` in the working directory:
 - `run_duration_ms: 0` — run until manually terminated (required for manual test sessions; set to 0 before debugging)
 - `run_duration_ms: N` — auto-exit after N ms (useful for quick smoke tests)
 
@@ -217,7 +216,7 @@ pkg/deej/
   util/util_windows.go
   util/util_linux.go
   icon/icon.go                 — tray/notification icon data (generated, do not edit)
-  icon/channel_icon.go         — OLED icon pipeline: Load(), box resize, threshold/dither, packSSD1306()
+  icon/channel_icon.go         — OLED icon pipeline: Load(), box resize, threshold, packSSD1306()
 ```
 
 ---
@@ -255,7 +254,13 @@ When writing a hand-rolled COM callback, declare pointer-typed callback paramete
 
 ## Remaining Work
 
-### Master Volume Mute Redesign (Windows) — compiles clean, NOT YET bench-tested
+### Revision Stamping — DEFERRED until final development version
+
+Upstream deej's build scripts stamped `main.gitCommit`/`main.versionTag` via ldflags (`-X main.gitCommit=... -X main.versionTag=...`) and had a `prepare-release.bat` pipeline to tag, build, and stage release binaries under `releases/vX.Y.Z/`. Those scripts were removed 2026-07-08 as dead weight (this fork builds exclusively via the manual command in "Building deej-x.exe" below, and no tagged-release workflow was in use). `main.go` still has the `gitCommit`/`versionTag` vars wired up and logs them if set — only the scripts that populated them are gone.
+
+**TODO:** once this fork reaches a final/stable development version, reintroduce revision stamping (either restore an updated version of the old scripts, matching the canonical `-H=windowsgui -X main.buildType=release` invocation, or fold `-X main.gitCommit=... -X main.versionTag=...` directly into the canonical build command in "Building deej-x.exe"). Not needed while still in active development.
+
+### Master Volume Mute Redesign (Windows) — BENCH-VERIFIED 2026-07-08
 
 Real WASAPI mute on the master output, mirroring how mic mute works. Implemented:
 - `masterSession.SetMuted(bool) error` (`session_windows.go`) — `s.volume.SetMute(muted, s.eventCtx)`. GUID echo-filtering works via existing `masterVolumeNotifyCallback` check; no time-window fallback needed for the output endpoint.
@@ -263,7 +268,15 @@ Real WASAPI mute on the master output, mirroring how mic mute works. Implemented
 - `DisplayManager.handleMasterMuteToggleRequest()` (`display.go`) — handler for CMD_REQUEST_MASTER_MUTE_TOGGLE (0x08): calls `toggleMasterMuted()`, pushes result via `SendMasterMuteState`/0x07, updates `lastPushedVolMuted`/`havePushedVolMuted`.
 - Linux `SetMuted`/`toggleMasterMuted` not yet implemented (`session_linux.go`).
 
-**Still needed:** bench verify encoder mute/unmute restores the real level, external Windows-mixer mute/unmute still works, and rapid repeated clicks don't desync `volMuted` from WASAPI state.
+**Bench test results (Windows, encoder single-click configured to `masterVol_mute`):**
+- Encoder click mutes/unmutes and restores the exact prior level — **pass**.
+- D16 button trigger — **untestable, no D16 on this hardware** (config default still applies for units that have it).
+- External mute/unmute via Windows Volume Mixer syncs to SERENITY's indicator in both directions — **pass**.
+- Rapid-click stress test: true sub-2-second rapid-fire lands as double/triple-click gestures (per `encoder_click_window_ms: 250`) rather than repeated single-click toggles, so this was retested at the fastest rate that still resolves as single clicks — **pass**, no desync between WASAPI state, deej's internal log state, and SERENITY's display.
+- Reconnect/beacon resync while muted (both directions) — **pass**.
+- Independence from mic mute (toggling one doesn't affect the other) — **pass**.
+
+Windows side is done pending real-world use. Linux (`session_linux.go`) still needs `SetMuted`/`toggleMasterMuted` implemented.
 
 ### Global Mic Mute — IMPLEMENTED, BUG UNDER INVESTIGATION
 
@@ -306,10 +319,6 @@ Likely plugs into `applyTargetTransform()` in `session_map.go` alongside existin
 ### Decouple Icon Selection from Process Name — DISCUSS BEFORE IMPLEMENTING
 
 Currently icon lookup is keyed off `targets[0]` from `slider_mapping` (lowercased, `.exe` stripped) — channel label has no effect. Idea: optional explicit icon key per channel, defaulting to current behavior. Overlaps with process group feature. Open questions: config shape, precedence, ordering relative to process groups.
-
-### Remove Dithering Support — DECIDED, not yet implemented
-
-In `channel_icon.go`: drop `applyFloydSteinberg`/`applyFloydSteinbergAlpha`, collapse `switch conversion` branches to threshold-only. Remove `icon_conversion` from `config.go`/`config.yaml` and `IconConversion` plumbing in `display.go`'s `pushAll()`/`handleIconRedrawRequest`.
 
 ### Soft Takeover — NOT DESIGNED
 
@@ -401,7 +410,7 @@ hid.mic_muter         IsMuted aggregate result  allMuted=true
 | Displayed icon size | 36×36 pixels (reduced from 48×48 to leave bounce room for screensaver) |
 | Wire format | 768 bytes — full 128×48 blue area in SSD1306 page order; icon at a given offset (46px horizontal / 6px vertical padding when centered) |
 | Bit order | SSD1306 native: each byte = one column of 8 vertical pixels; bit 0 = topmost pixel of page |
-| Conversion | Always threshold (dithering removed — see "Remove Dithering Support") |
+| Conversion | Always threshold (dithering removed) |
 | `master` slot (index 0) | Skip icon push — master OLED is encoder-controlled, not a channel display |
 | `deej.unmapped` slot | Use bundled default icon; user can override with `unmapped.png` in `icon_dir` |
 | `system` slot | Use bundled default icon; user can override with `system.png` in `icon_dir` |

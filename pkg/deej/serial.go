@@ -499,7 +499,15 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 			sio.currentSliderPositions[sliderIdx] = dirtyFloat
 
 			if !primingMasterSlider && !isMasterVolumeEcho {
-				curvedScalar := util.ApplyVolumeCurve(dirtyFloat, sio.deej.config.VolumeCurve, sio.deej.config.VolumeCurveDbFloor)
+				// slider 0 (the master encoder) is always linear, 1:1 with the host's
+				// 0-100% volume scale, regardless of the configured volume_curve - that
+				// setting only shapes the physical faders' response (1-5). Master's
+				// encoder ticks already map directly to Windows volume percentage points
+				// on the firmware side, so curving it here would desync the two.
+				curvedScalar := dirtyFloat
+				if sliderIdx != 0 {
+					curvedScalar = util.ApplyVolumeCurve(dirtyFloat, sio.deej.config.VolumeCurve, sio.deej.config.VolumeCurveDbFloor)
+				}
 
 				moveEvents = append(moveEvents, SliderMoveEvent{
 					SliderID:     sliderIdx,

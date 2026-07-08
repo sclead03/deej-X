@@ -46,6 +46,8 @@ noise_reduction: default
 # "log" - slider position maps to a dB value between volume_curve_db_floor and 0dB (full up),
 #         which is then converted to volume; matches how real mixing console faders feel,
 #         since human hearing perceives loudness on a logarithmic scale, not a linear one
+# only applies to the physical faders (slots 1-5) - the master encoder (slot 0) is always
+# linear, 1:1 with the host's 0-100% volume, regardless of this setting
 volume_curve: log
 
 # only used when volume_curve is "log" - the dB level treated as "fully down" on the slider

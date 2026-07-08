@@ -4,7 +4,7 @@ IF "%GOPATH%"=="" GOTO NOGO
 IF NOT EXIST %GOPATH%\bin\rsrc.exe GOTO INSTALL
 :POSTINSTALL
 ECHO Creating pkg/deej/cmd/main.syso
-%GOPATH%\bin\rsrc -manifest pkg\deej\assets\deej.manifest -ico pkg\deej\assets\deej_x.ico -o pkg\deej\cmd\main.syso
+%GOPATH%\bin\rsrc -manifest pkg\deej\assets\deej.manifest -ico assets\deej_x.ico -o pkg\deej\cmd\main.syso
 GOTO DONE
 
 :INSTALL

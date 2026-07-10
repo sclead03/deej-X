@@ -51,7 +51,8 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `slider_mapping` | ✓ existing | 6-channel SERENITY layout in default config |
 | `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
 | `icon_dir` | ✓ implemented | Directory containing PNG icon files; relative or absolute path |
-| `d16_button.action` | ✓ implemented | Action for D16 (PF7) button press. Same values as encoder gesture actions: `masterVol_mute`, `play_pause`, `skip_forward`, `skip_back`, `mute_mic`, `unmute_mic`. Default `masterVol_mute`. |
+| `d16_button.single_click` / `.double_click` / `.triple_click` | ✓ implemented | D16 (PF7) button gesture actions — identical single/double/triple-click handling to `encoder_gestures` (same shared click window, same action IDs: `masterVol_mute`, `play_pause`, `skip_forward`, `skip_back`, `mute_mic`, `unmute_mic`). Defaults: single `masterVol_mute`, double `play_pause`, triple `skip_forward`. Pushed on every beacon via `SET_D16_ACTION` (0x0E, 3-byte payload). Replaces the old single-value `d16_button.action` key. |
+| `screensaver_timeout_s` | ✓ implemented | Idle time in seconds before SERENITY's OLED screensaver engages. Range 30–1800, default 180. Pushed on every beacon via `SET_SCREENSAVER_TIMEOUT` (0x0F). |
 | `newInput_behavior` | pending | `mute` or `unmute`. On startup and whenever a new input device connects, immediately enforce this state on all connected input devices. Not yet implemented. |
 
 ---
@@ -83,10 +84,11 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 | `SET_MIC_MUTE_STATE` | `0x05` | `[muted]` | `0x00` unmuted / `0x01` muted |
 | `SET_MASTER_MUTE_STATE` | `0x07` | `[muted]` | `0x00` unmuted / `0x01` muted; master output WASAPI mute state |
 | `SET_GESTURE_CONFIG` | `0x09` | `[single][double][triple]` | Encoder gesture → action mapping; action IDs: 0=MasterVolMute 1=PlayPause 2=SkipForward 3=SkipBack 4=MicMute 5=MicUnmute. Pushed on every beacon. |
-| `SET_CLICK_WINDOW` | `0x0B` | `[ms_lo][ms_hi]` | Encoder click-window duration, uint16 LE, ms. Default 250; host enforces 50–1000. Pushed on every beacon. |
+| `SET_CLICK_WINDOW` | `0x0B` | `[ms_lo][ms_hi]` | Click-window duration, uint16 LE, ms — shared by encoder and D16 button gesture disambiguation. Default 250; host enforces 50–1000. Pushed on every beacon. |
 | `SET_SLIDER_COUNT` | `0x0C` | `[count]` | Active channel count, uint8, 0–5. Firmware gates all channel interactions to this number. Pushed on every beacon. |
 | `SET_DISPLAY_GAP` | `0x0D` | `[gap]` | Inter-display dead pixel count, uint8, 0–100. Firmware stores in EEPROM. Pushed on every beacon. |
-| `SET_D16_ACTION` | `0x0E` | `[action]` | D16 button (PF7) gesture action, uint8, same action IDs as SET_GESTURE_CONFIG. Default MasterVolMute. Pushed on every beacon. |
+| `SET_D16_ACTION` | `0x0E` | `[single][double][triple]` | D16 button (PF7) gesture → action mapping, mirrors SET_GESTURE_CONFIG's payload shape and action IDs. Defaults: MasterVolMute/PlayPause/SkipForward. Pushed on every beacon. |
+| `SET_SCREENSAVER_TIMEOUT` | `0x0F` | `[s_lo][s_hi]` | Idle timeout before screensaver engages, uint16 LE, seconds. Default 180; host enforces 30–1800. Persisted to firmware EEPROM. Pushed on every beacon. |
 
 **Firmware → host CMD_IDs:**
 

@@ -80,8 +80,9 @@ type CanonicalConfig struct {
 	MicMute               MicMuteConfig
 	Gestures              GestureConfig
 	RGBButtonAction       string
-	D16ButtonAction       byte
+	D16Gestures           GestureConfig
 	EncoderClickWindowMs  int
+	ScreensaverTimeoutS   int
 
 	logger             *zap.SugaredLogger
 	notifier           Notifier
@@ -121,8 +122,11 @@ const (
 	configKeyGestureDoubleClick    = "encoder_gestures.double_click"
 	configKeyGestureTripleClick    = "encoder_gestures.triple_click"
 	configKeyEncoderClickWindow    = "encoder_click_window_ms"
+	configKeyScreensaverTimeout    = "screensaver_timeout_s"
 	configKeyRGBButtonAction       = "rgb_button.action"
-	configKeyD16ButtonAction       = "d16_button.action"
+	configKeyD16SingleClick        = "d16_button.single_click"
+	configKeyD16DoubleClick        = "d16_button.double_click"
+	configKeyD16TripleClick        = "d16_button.triple_click"
 	configKeyNumSliders            = "num_sliders"
 	configKeyDisplayGapPixels      = "display_gap_pixels"
 
@@ -138,6 +142,10 @@ const (
 	defaultEncoderClickWindowMs = 250
 	minEncoderClickWindowMs     = 50
 	maxEncoderClickWindowMs     = 1000
+
+	defaultScreensaverTimeoutS = 180
+	minScreensaverTimeoutS     = 30
+	maxScreensaverTimeoutS     = 1800
 
 	defaultVolumeCurve        = util.VolumeCurveLinear
 	defaultVolumeCurveDbFloor = -60.0
@@ -466,7 +474,9 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	cc.Gestures.SingleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureSingleClick), GestureActionMasterMute, cc.logger)
 	cc.Gestures.DoubleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureDoubleClick), GestureActionPlayPause, cc.logger)
 	cc.Gestures.TripleClick = parseGestureAction(cc.userConfig.GetString(configKeyGestureTripleClick), GestureActionSkipForward, cc.logger)
-	cc.D16ButtonAction = parseGestureAction(cc.userConfig.GetString(configKeyD16ButtonAction), GestureActionMasterMute, cc.logger)
+	cc.D16Gestures.SingleClick = parseGestureAction(cc.userConfig.GetString(configKeyD16SingleClick), GestureActionMasterMute, cc.logger)
+	cc.D16Gestures.DoubleClick = parseGestureAction(cc.userConfig.GetString(configKeyD16DoubleClick), GestureActionPlayPause, cc.logger)
+	cc.D16Gestures.TripleClick = parseGestureAction(cc.userConfig.GetString(configKeyD16TripleClick), GestureActionSkipForward, cc.logger)
 
 	clickWindow := cc.userConfig.GetInt(configKeyEncoderClickWindow)
 	if clickWindow == 0 {
@@ -480,6 +490,19 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		clickWindow = defaultEncoderClickWindowMs
 	}
 	cc.EncoderClickWindowMs = clickWindow
+
+	screensaverTimeout := cc.userConfig.GetInt(configKeyScreensaverTimeout)
+	if screensaverTimeout == 0 {
+		screensaverTimeout = defaultScreensaverTimeoutS
+	} else if screensaverTimeout < minScreensaverTimeoutS || screensaverTimeout > maxScreensaverTimeoutS {
+		cc.logger.Warnw("screensaver_timeout_s out of range, using default",
+			"value", screensaverTimeout,
+			"min", minScreensaverTimeoutS,
+			"max", maxScreensaverTimeoutS,
+			"default", defaultScreensaverTimeoutS)
+		screensaverTimeout = defaultScreensaverTimeoutS
+	}
+	cc.ScreensaverTimeoutS = screensaverTimeout
 
 	action := strings.ToLower(strings.TrimSpace(cc.userConfig.GetString(configKeyRGBButtonAction)))
 	if action == "" {

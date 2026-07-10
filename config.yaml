@@ -92,10 +92,22 @@ rgb_button:
 # firmware adds 40ms debounce headroom on top of this value internally
 encoder_click_window_ms: 250
 
+# idle time in seconds before the OLED screensaver engages (default 180, range 30–1800)
+# resets on any fader/button/encoder/RGB-button input
+screensaver_timeout_s: 180
+
 # encoder button gesture configuration
 # actions: masterVol_mute, play_pause, skip_forward, skip_back, mute_mic, unmute_mic
 # Note: mute_mic and unmute_mic require a firmware update to support action IDs 4/5.
 encoder_gestures:
+  single_click: masterVol_mute
+  double_click: play_pause
+  triple_click: skip_forward
+
+# D16 (PF7) auxiliary button gesture configuration — identical single/double/triple
+# click handling to the encoder button above (same click window, same action IDs);
+# NC on current PCB revision, reserved for future revision
+d16_button:
   single_click: masterVol_mute
   double_click: play_pause
   triple_click: skip_forward

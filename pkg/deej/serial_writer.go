@@ -26,6 +26,7 @@ const (
 	cmdSetSliderCount    = byte(0x0C)
 	cmdSetDisplayGap     = byte(0x0D)
 	cmdSetD16Action      = byte(0x0E)
+	cmdSetScreensaverTimeout = byte(0x0F)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -190,10 +191,19 @@ func (sw *SerialWriter) SendGestureConfig(single, double, triple byte) error {
 	return sw.send(cmdSetGestureConfig, []byte{single, double, triple})
 }
 
-// SendD16Action pushes the D16 button → action mapping to SERENITY.
-// action is one of the GestureAction* constants from config.go.
-func (sw *SerialWriter) SendD16Action(action byte) error {
-	return sw.send(cmdSetD16Action, []byte{action})
+// SendD16GestureConfig pushes the D16 button's single/double/triple-click gesture
+// mapping to SERENITY, mirroring SendGestureConfig's payload shape for the encoder
+// button. Each argument is one of the GestureAction* constants from config.go.
+func (sw *SerialWriter) SendD16GestureConfig(single, double, triple byte) error {
+	return sw.send(cmdSetD16Action, []byte{single, double, triple})
+}
+
+// SendScreensaverTimeout pushes the idle timeout (seconds, uint16 LE) before
+// SERENITY's screensaver engages.
+func (sw *SerialWriter) SendScreensaverTimeout(seconds uint16) error {
+	payload := make([]byte, 2)
+	binary.LittleEndian.PutUint16(payload, seconds)
+	return sw.send(cmdSetScreensaverTimeout, payload)
 }
 
 func (sw *SerialWriter) send(cmdID byte, payload []byte) error {

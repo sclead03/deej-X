@@ -107,11 +107,18 @@ func (dm *DisplayManager) pushEncoderConfig(writer *SerialWriter) {
 		dm.logger.Debugw("Sent display gap", "pixels", gap)
 	}
 
-	d16 := dm.deej.config.D16ButtonAction
-	if err := writer.SendD16Action(d16); err != nil {
-		dm.logger.Warnw("Failed to send D16 button action", "error", err)
+	d16 := dm.deej.config.D16Gestures
+	if err := writer.SendD16GestureConfig(d16.SingleClick, d16.DoubleClick, d16.TripleClick); err != nil {
+		dm.logger.Warnw("Failed to send D16 gesture config", "error", err)
 	} else {
-		dm.logger.Debugw("Sent D16 button action", "action", d16)
+		dm.logger.Debugw("Sent D16 gesture config", "single", d16.SingleClick, "double", d16.DoubleClick, "triple", d16.TripleClick)
+	}
+
+	ssTimeout := uint16(dm.deej.config.ScreensaverTimeoutS)
+	if err := writer.SendScreensaverTimeout(ssTimeout); err != nil {
+		dm.logger.Warnw("Failed to send screensaver timeout", "error", err)
+	} else {
+		dm.logger.Debugw("Sent screensaver timeout", "seconds", ssTimeout)
 	}
 }
 

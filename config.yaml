@@ -66,7 +66,7 @@ slider_mapping:
   2: spotify.exe
   3: deej.unmapped
   4: deej.steam
-  5: zoom.exe
+  5: system
 
 # display names for SERENITY OLEDs; 0 = master encoder label, 1-5 = fader OLEDs (match slider_mapping keys)
 # Accented characters supported: é, É, ü, Ü, ö, Ö, ä, Ä, ñ, Ñ
@@ -78,7 +78,7 @@ channel_names:
   2: Spotify
   3: Unmapped
   4: Steam
-  5: Zoom
+  5: System
 
 # RGB button (mic mute button) action
 # actions: mic_mute_toggle (default), mute_mic, unmute_mic, masterVol_mute
@@ -120,3 +120,9 @@ d16_button:
 mic_mute:
   mute_action: mute.all
   unmute_action: unmute.all
+
+# write deej-x's own log file to logs/ (release builds only; the debug build
+# always logs regardless of this setting). Off by default to avoid wasting
+# disk space during normal use — turn on only when you need to investigate
+# an issue with the regular tray app.
+enable_logging: false

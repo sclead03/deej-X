@@ -25,10 +25,16 @@ const (
 	consoleFieldTruncateLen = 120
 )
 
-// NewLogger provides a logger instance for the whole program
-func NewLogger(buildType string) (*zap.SugaredLogger, error) {
+// NewLogger provides a logger instance for the whole program. enableLogging only
+// affects release builds - the debug build always logs (that's its purpose), and
+// dev builds (go run) only ever log to stderr and never touch disk regardless.
+func NewLogger(buildType string, enableLogging bool) (*zap.SugaredLogger, error) {
 	if buildType == buildTypeDebug {
 		return newDebugLogger()
+	}
+
+	if buildType == buildTypeRelease && !enableLogging {
+		return zap.NewNop().Sugar(), nil
 	}
 
 	var loggerConfig zap.Config

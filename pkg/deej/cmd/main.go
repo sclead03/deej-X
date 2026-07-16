@@ -24,10 +24,34 @@ func init() {
 	flag.Parse()
 }
 
+// readEnableLoggingFlag peeks at config.yaml's enable_logging key without going
+// through the full viper-backed config system, which requires a logger to exist
+// first. Defaults to false (matching config.yaml's documented default) if the
+// file is missing, unreadable, or the key isn't set.
+func readEnableLoggingFlag() bool {
+	type loggingConfig struct {
+		EnableLogging bool `yaml:"enable_logging"`
+	}
+
+	data, err := os.ReadFile("config.yaml")
+	if err != nil {
+		return false
+	}
+
+	var cfg loggingConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return false
+	}
+
+	return cfg.EnableLogging
+}
+
 func main() {
 
-	// first we need a logger
-	logger, err := deej.NewLogger(buildType)
+	// first we need a logger. release builds only log if config.yaml opts in via
+	// enable_logging - read it directly here since the full config system (config.go)
+	// needs a logger to already exist before it can load anything.
+	logger, err := deej.NewLogger(buildType, readEnableLoggingFlag())
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create logger: %v", err))
 	}

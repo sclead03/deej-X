@@ -8,6 +8,32 @@
 - **Windows is the primary target.** Linux is best-effort secondary. All features must work on Windows. Linux implementations follow the same OS-abstraction pattern already established in the codebase.
 - **This is a personal fork, not an upstream PR.** Do not attempt to maintain compatibility with the vanilla deej serial protocol or configuration format beyond what is documented here.
 - **Investigate build/vet errors before calling them pre-existing or unrelated.** See "Build & Verification Gotchas" below — it documents real, root-caused issues (and how to actually verify the Linux build via WSL) found by digging in, not by waving errors away.
+- **Check "Testing & Verification Status" before suggesting a test.** Don't propose re-testing a ✅ item unless the current diff touches one of its listed files — that section exists specifically so already-verified functionality doesn't get re-suggested every session.
+
+---
+
+## Testing & Verification Status
+
+Legend: ✅ Verified — don't re-suggest unless listed files changed · ⬜ Not yet verified — fair game to test next · 🚫 Blocked — no hardware or not implemented, don't suggest testing it
+
+### ✅ Verified — retest only if listed files change
+
+- **Master volume mute (Windows, encoder single-click)** — BENCH-VERIFIED 2026-07-08. Covered: encoder toggle+restore exact level, external Windows Volume Mixer sync (both directions), rapid-click gesture disambiguation, reconnect/beacon resync while muted, independence from mic mute. Files: `session_windows.go` (`SetMuted`), `session_map.go` (`toggleMasterMuted`), `display.go` (`handleMasterMuteToggleRequest`).
+- **Single-device mic mute (Windows)** — verified via commit `e74a304` ("Verified test logs for four use cases", 2026-06-28ish). Files: `hid_windows.go` (`applyToDevices`, `IsMuted`, `queryCaptureAllMuted`), `display.go` (`handleExternalMicMuteChange`, single-device path only — multi-device path is the open bug below).
+
+### ⬜ Not yet verified
+
+- **Multi-device mic mute** — active bug, see "Active Bugs" below for full debug plan.
+- **`enable_logging` config gate** (commit `507603e`) — implemented, not bench-tested: does `false` actually suppress the log file write, does `Fatal`/`Fatalw` still terminate the process.
+- **Screensaver disable delay** (commit `4d4212d`) — implemented, not bench-tested on hardware.
+- **Linear/log fader curve, dB floor, deadzone config** (commit `b2ee470`) — implemented, not bench-tested.
+- **Screensaver hardware verification** (icon redraw/bounce, `CMD_REQUEST_ICON_REDRAW`/`LoadAt()`) — full idle → screensaver → wake cycle not yet exercised.
+
+### 🚫 Blocked — don't suggest testing
+
+- **D16 button gestures** — no D16 hardware on this unit; untestable until a unit with that pin exists.
+- **Linux HID enumeration / mic mute** — `openSERENITY()` not implemented.
+- **Linux master mute** (`SetMuted`/`toggleMasterMuted` in `session_linux.go`) — not implemented.
 
 ---
 
@@ -333,58 +359,44 @@ Move takeover logic to host (currently firmware-only for per-channel mute) and e
 
 ### Multi-device mic mute nonfunctional
 
-**Symptom:** Mic mute behavior breaks when more than one input device is connected. Exact failure mode not yet characterized — debug session in progress.
+**Symptom:** Mic mute behavior breaks when more than one input device is connected. Exact failure mode not yet characterized — being run down via the layered test plan below, one layer at a time.
 
-**Code paths under investigation** (verified line numbers as of 2026-06-28 — check git blame if refactored):
-- `hid_windows.go:318` `applyToDevices()` — creates fresh enumerator, iterates all active capture devices, calls `SetMute`; logs "applyToDevices start/done" with total count
-- `hid_windows.go:432` `IsMuted()` — creates fresh enumerator, delegates to `queryCaptureAllMuted()`; logs "IsMuted aggregate result"
-- `hid_windows.go:235` `queryCaptureAllMuted()` — iterates all active capture devices, returns true only if every one is muted; short-circuits on the first unmuted device (aggregate is already known false, no need to poll further); logs per-device GetMute results only up to the first unmuted device
-- `session_finder_windows.go:752` `registerMicMuteChangeCallback()` — (re)builds `captureAevs` slice under `captureAevsMu`, registers `micMuteCallback` on all active capture devices; logs "Registered mic mute change callbacks on capture devices registered=N total=N"
-- `session_finder_windows.go:911` `deviceStateChangedCallback()` → `session_finder_windows.go:928` `handleDeviceStateChanged()` — hotplug handler; fully rebuilds `captureAevs` under `captureAevsMu`, re-registers callbacks, pushes updated aggregate; logs "Device state changed, pushing updated aggregate allMuted=..."
-- `session_finder_windows.go:872` `micMuteNotifyCallback()` → `session_finder_windows.go:883` `handleMicMuteNotification()` — fires on any registered device's mute change; re-queries full aggregate via `allCaptureDevicesMuted()`; logs "Mic mute notify callback fired" and "Mic mute aggregate computed"
-- `session_map.go`: `setupMicMuteWatcher()` — forwards aggregate changes from `sf.micMuteChanges` to consumers; `micMuteRecentlySetByButton()` suppression window (500ms) can block legitimate second-device notifications
-- `display.go`: `handleExternalMicMuteChange()` — pushes aggregate to SERENITY and updates `HIDManager` cache; currently no dedup — pushes on every notification regardless of whether aggregate changed (known gap)
+**Code paths under investigation** (verified 2026-07-17 — check git blame if refactored):
+- `hid_windows.go:318` `applyToDevices()` — fresh enumerator, iterates active capture devices, pre-checks each device's current mute state and **skips `SetMute` if already correct** (driver-quirk workaround). Logs: `"applyToDevices start"` (L367), `"SetMute skipped, already in desired state"` (L410) or `"SetMute succeeded"` (L415), `"applyToDevices done"` (L429).
+- `hid_windows.go:444` `IsMuted()` — delegates to `queryCaptureAllMuted()`; logs `"IsMuted aggregate result"` (L472).
+- `hid_windows.go:235` `queryCaptureAllMuted()` — logs `"device count"` (L248); **short-circuits at L302-304** on the first unmuted device, so per-device `GetMute` logs stop there — with 3+ devices, later devices never get logged even though the aggregate value itself is still correct.
+- `session_finder_windows.go:766` `registerMicMuteChangeCallback()` — (re)builds `captureAevs` under `captureAevsMu`; logs `"Registered mic mute change callbacks on capture devices"` (L837).
+- `session_finder_windows.go:935` `deviceStateChangedCallback()` — **does not inspect `dwNewState`**, fires identically for arrival, disable, and unplug; logs `"Device state changed callback fired"` (L940). **No debounce** on this path (unlike the 100ms-debounced default-device-change callback) — plausible race source under rapid flapping.
+- `session_finder_windows.go:953` `handleDeviceStateChanged()` — fully rebuilds `captureAevs` (only currently-`DEVICE_STATE_ACTIVE` devices survive); logs `"Rebuilt captureAevs after device state change"` (L1024), then `"Device state changed, pushing updated aggregate"` (L1034).
+- `session_finder_windows.go:886` `micMuteNotifyCallback()` → `session_finder_windows.go:897` `handleMicMuteNotification()` — logs `"Mic mute notify callback fired"` (L898). Checks `micMuteSuppressCheck` **before** querying the aggregate at all — if suppressed, logs `"Mic mute notify: suppressing echo of button press, skipping aggregate query"` (L906) and returns without querying (not just a push-level dedup); otherwise logs `"Mic mute aggregate computed"` (L916).
+- `session_map.go:707` `micMuteRecentlySetByButton()` — pure 500ms time window (`micMuteEchoSuppressWindow`, `session_map.go:82`) since the last button-triggered write; not per-device or aggregate-value aware, so it can drop a legitimate second-device notification that lands inside the window.
+- `display.go:219` `handleExternalMicMuteChange()` — pushes `SendMicMuteState` and logs `"Pushed live mic mute update"` (L234) unconditionally on every call, regardless of whether the aggregate value actually changed. **Known implementation gap, not a new bug** — don't re-flag it as one.
+- No `*_test.go` files exist anywhere in the repo — everything below is manual/hardware-in-the-loop.
+- `newInput_behavior` still unimplemented (only referenced in this doc) — out of scope for this bug hunt.
 
-**Debug session setup:**
-1. Ensure `debug.yaml` has `run_duration_ms: 0` (already set — verified 2026-06-28).
-2. Run `deej-x_debug.exe` from the project directory (pre-built; no rebuild needed unless code changed); log appears in `logs/deej-debug-<timestamp>.log`.
-3. Test sequence: single device → confirm mute works → plug in second device → confirm/deny device-change callback fired → test mute again.
+**Layered test plan** (run in order; scope is 2-device hardware for now, Layer 9 deferred until a 3rd device is available):
 
-**Key log lines to watch (by stage):**
+*Layer 0 — Preconditions:* `deej-x_debug.exe` freshly built, `debug.yaml` has `run_duration_ms: 0`. Clear/note `logs/` before each layer so each session's log file is unambiguous.
 
-*Startup / single device:*
-```
-session_finder        Registered mic mute change callbacks on capture devices  registered=1 total=1
-```
+*Layer 1 — Single-device smoke check (not a full retest):* Launch with 1 device connected, confirm `registered=1 total=1` once at startup. Just confirms the current build didn't regress the already-✅-verified single-device path (see "Testing & Verification Status") — don't re-run the full single-device bench suite.
 
-*Button press with 1 device (baseline):*
-```
-hid.mic_muter         applyToDevices start  muted=true ... total=1
-hid.mic_muter         SetMute succeeded  deviceIdx=0 device="<name>" muted=true
-hid.mic_muter         applyToDevices done  applied=1 total=1
-hid                   Pushed mic mute state  muted=true
-```
+*Layer 2 — Two devices connected before launch (steady-state aggregate):* Both connected before starting the app; confirm `registered=2 total=2` at startup. Press mute: expect `applyToDevices start ... total=2`, two `SetMute succeeded`/`skipped, already in desired state` lines, `applied=2 total=2`, then `IsMuted aggregate result allMuted=true`. Unmute: same, `allMuted=false`. **Pass:** both devices always end in the same state as each other and as the button action, regardless of starting state.
 
-*After plugging in second device — must see all three:*
-```
-session_finder        Device state changed, pushing updated aggregate  allMuted=false
-```
-*(and from handleDeviceStateChanged's inline rebuild — note: this does NOT log "Registered mic mute change callbacks"; check captureAevs count indirectly via subsequent button press behavior)*
+*Layer 3 — Hotplug arrival (1 → 2 while running):* Start with 1 device, plug in the 2nd while running. Confirm `"Device state changed callback fired"` → `"Rebuilt captureAevs after device state change" registered=2` → `"Device state changed, pushing updated aggregate"`. Press mute afterward: confirm `applyToDevices ... total=2`, not still `total=1` — this is the original bug report's core suspected failure point.
 
-*Button press with 2 devices — what we expect vs. what may actually happen:*
-```
-hid.mic_muter         applyToDevices start  muted=true ... total=2      ← must be 2
-hid.mic_muter         SetMute succeeded  deviceIdx=0 ...
-hid.mic_muter         SetMute succeeded  deviceIdx=1 ...
-hid.mic_muter         applyToDevices done  applied=2 total=2            ← both must apply
-hid.mic_muter         IsMuted aggregate result  allMuted=true
-```
+*Layer 4 — Hotplug removal (2 → 1 while running):* With 2 devices connected and muted, unplug one. Confirm the same rebuild/push sequence fires (removal isn't filtered out per the `dwNewState` finding above). Confirm aggregate recomputes off the *remaining* device only (`registered=1`), and a subsequent button press only targets it (`total=1`). Repeat starting from both-unmuted.
 
-**Suspected failure points (not yet confirmed):**
-- `deviceStateChangedCallback` may not fire reliably for USB device arrival (vs. default-device change). Absence of the "Device state changed" log confirms this.
-- `handleDeviceStateChanged` may find 0 or 1 devices if the device hasn't reached `DEVICE_STATE_ACTIVE` by the time the goroutine enumerates — timing race on USB enumeration.
-- `applyToDevices` total=1 despite 2 devices being present would indicate its fresh enumerator isn't seeing the new device; would suggest it's being called before OS audio stack registers the device.
-- Suppression window (`micMuteRecentlySetByButton`, 500ms) incorrectly blocking a legitimate second-device notification is a lower-probability but possible cause.
+*Layer 5 — Mixed starting state at button press:* With 2 devices connected, use Windows Sound settings to put them in different states (one muted, one not) before pressing the SERENITY button. Confirm `mute.all`/`unmute.all` forces both to the same target state, and specifically confirm the skip-if-already-correct path doesn't drop the skipped device from the applied count — `applied=2 total=2` should hold even when one device needed no change.
+
+*Layer 6 — External per-device changes via OS Sound settings:* With 2 devices connected, mute/unmute one at a time from Windows' native UI (not the SERENITY button). Confirm the aggregate *value* SERENITY ends up showing is always correct (muted only when both are muted). **Known gap, not a failure:** expect a push (`"Pushed live mic mute update"`) on every individual device change even when the aggregate didn't change — log the push count for later comparison once dedup is implemented, but don't treat the redundant pushes as this bug.
+
+*Layer 7 — Suppression window interaction (best-effort/exploratory):* Press the SERENITY mute button, then within 500ms externally change the *other* device via Windows Sound settings. Watch for `"suppressing echo of button press, skipping aggregate query"` and check whether the second device's legitimate external change gets dropped. Hard to hit deterministically — a few attempts are enough to characterize, not exhaustively reproduce.
+
+*Layer 8 — Rapid flap / race exploration (best-effort/exploratory):* Quickly unplug and replug one device (within a couple seconds). No debounce exists on `handleDeviceStateChanged`, so this is the most likely place to catch a genuine race (`captureAevs` rebuilding against a device the OS hasn't finished re-enumerating). Note any `total=` count that looks wrong, or any crash/panic.
+
+*Layer 9 — DEFERRED: 3+ device aggregate:* Requires a 3rd input device; run once Layers 2–8 are fully resolved. Specifically exercises the `queryCaptureAllMuted` short-circuit: with 3 devices where the 2nd is unmuted, confirm the log goes dark for the 3rd device (expected, not a bug) while `allMuted=false` is still correct.
+
+**After each layer passes:** move it into "Testing & Verification Status" ✅ with the files it covers (per the verification-scope memory), so future sessions don't re-suggest retesting it. Any layer that reveals a genuine failure replaces the vague "exact failure mode not yet characterized" line above with a precise symptom.
 
 ---
 

@@ -43,7 +43,61 @@ type sessionMap struct {
 
 	masterVolumeChangeConsumers []chan MasterVolumeUpdate
 	micMuteChangeConsumers      []chan bool
+
+	// takeoverMu guards awaitingPositionBaseline and channelTakeover below. Separate
+	// from lock (which guards the session map m itself) since the beacon-reset
+	// goroutine (setupOnBeacon) and the slider-move goroutine (setupOnSliderMove)
+	// touch these two maps independently of any session map access.
+	takeoverMu sync.Mutex
+
+	// awaitingPositionBaseline tracks, per fader slider ID (1..NumSliders), whether
+	// we're still waiting for a trustworthy first physical-position reading since
+	// the last (re)connect - see setupOnBeacon/evaluatePositionBaseline. A slider
+	// stuck at 0 (which may just mean muted, or genuinely resting at 0 - the host
+	// can't tell the two apart, see CLAUDE.md "Soft Takeover at Connect") keeps
+	// this true until it reports a real nonzero value.
+	awaitingPositionBaseline map[int]bool
+
+	// channelTakeover holds the in-progress per-app position sync state for any
+	// fader slider currently showing the "move up"/"move down" screen. Absence
+	// from this map means the slider is operating normally.
+	channelTakeover map[int]*channelTakeoverState
 }
+
+// takeoverPhase is which direction a channel's position sync check is currently
+// soliciting movement in.
+type takeoverPhase uint8
+
+const (
+	takeoverPhaseUp takeoverPhase = iota
+	takeoverPhaseDown
+)
+
+// takeoverEntry is one app on a slider's target list, and whether the physical
+// slider has crossed its volume yet during a position sync check.
+type takeoverEntry struct {
+	session  Session
+	target   float32
+	captured bool
+}
+
+// channelTakeoverState is the in-progress position sync check for one fader
+// slider - see CLAUDE.md "Soft Takeover at Connect". Apps are split into two
+// piles at arm time (above the slider's starting position, and below it) and
+// captured one at a time as the physical slider actually crosses each app's
+// current volume; captured apps track the slider live from that point on,
+// uncaptured apps are left completely untouched until their turn.
+type channelTakeoverState struct {
+	phase takeoverPhase
+	up    []*takeoverEntry
+	down  []*takeoverEntry
+}
+
+// takeoverMatchTolerance is how close a physical slider reading has to be to an
+// app's current volume to be considered "already matching" - no need to wait
+// for an exact bit-for-bit match. Mirrors the ~1% noise floor SERENITY's own
+// firmware uses for its send-gating and mute/unmute takeover (kMinChange).
+const takeoverMatchTolerance = 0.01
 
 // MasterVolumeUpdate is delivered to SubscribeToMasterVolumeChanges subscribers.
 // ForceSync marks the periodic settle push (see masterVolumeSettleDelay) that
@@ -117,11 +171,13 @@ func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionF
 	logger = logger.Named("sessions")
 
 	m := &sessionMap{
-		deej:          deej,
-		logger:        logger,
-		m:             make(map[string][]Session),
-		lock:          &sync.Mutex{},
-		sessionFinder: sessionFinder,
+		deej:                     deej,
+		logger:                   logger,
+		m:                        make(map[string][]Session),
+		lock:                     &sync.Mutex{},
+		sessionFinder:            sessionFinder,
+		awaitingPositionBaseline: make(map[int]bool),
+		channelTakeover:          make(map[int]*channelTakeoverState),
 	}
 
 	logger.Debug("Created session map instance")
@@ -137,6 +193,7 @@ func (m *sessionMap) initialize() error {
 
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
+	m.setupOnBeacon()
 
 	if watcher, ok := m.sessionFinder.(MasterVolumeWatcher); ok {
 		m.setupMasterVolumeWatcher(watcher)
@@ -209,6 +266,39 @@ func (m *sessionMap) setupOnSliderMove() {
 			case event := <-sliderEventsChannel:
 				m.handleSliderMoveEvent(event)
 			}
+		}
+	}()
+}
+
+// setupOnBeacon resets the connect-time position sync check on every (re)connect
+// - first launch, USB replug, or an app-level reconnect all re-run it the same
+// way, matching how the display push already re-syncs everything on any
+// (re)connect (see CLAUDE.md "Soft Takeover at Connect"). Any takeover left
+// mid-sequence from a previous connection is dropped and its screen restored,
+// since the physical/session state on the other side of a reconnect can't be
+// trusted to still match what was being tracked.
+func (m *sessionMap) setupOnBeacon() {
+	beaconChannel := m.deej.serial.SubscribeToBeaconEvents()
+
+	go func() {
+		for range beaconChannel {
+			writer := m.deej.serial.Writer()
+
+			m.takeoverMu.Lock()
+			for i := range m.channelTakeover {
+				delete(m.channelTakeover, i)
+				if writer != nil {
+					if err := writer.SendChannelTakeoverDisplay(byte(i-1), TakeoverDisplayRestore); err != nil {
+						m.logger.Warnw("Failed to restore channel display after reconnect", "slider", i, "error", err)
+					}
+				}
+			}
+
+			m.awaitingPositionBaseline = make(map[int]bool, m.deej.config.NumSliders)
+			for i := 1; i <= m.deej.config.NumSliders; i++ {
+				m.awaitingPositionBaseline[i] = true
+			}
+			m.takeoverMu.Unlock()
 		}
 	}()
 }
@@ -431,6 +521,14 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 
 func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 
+	// Fader sliders (1..NumSliders) run through the connect-time position sync
+	// check first. Slider 0 (the master encoder) has its own separate sync
+	// mechanism (SET_MASTER_VOLUME/pushMasterState in display.go) and never
+	// participates here. See CLAUDE.md "Soft Takeover at Connect".
+	if event.SliderID != 0 && m.handlePositionSyncEvent(event) {
+		return
+	}
+
 	// first of all, ensure our session map isn't moldy
 	if m.lastSessionRefresh.Add(maxTimeBetweenSessionRefreshes).Before(time.Now()) {
 		m.logger.Debug("Stale session map detected on slider move, refreshing")
@@ -494,6 +592,180 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		// (or another, more catastrophic failure happens)
 		m.refreshSessions(true)
 	}
+}
+
+// handlePositionSyncEvent intercepts fader slider events for the connect-time
+// position sync check (see CLAUDE.md "Soft Takeover at Connect"). Returns true
+// if it fully handled this event - an in-progress takeover, or a baseline
+// reading that either needs to keep waiting or just armed a new takeover - in
+// which case the caller must not fall through to the normal per-target apply.
+// Returns false when there's nothing to intercept (steady-state operation, or
+// a baseline reading that found everything already matching), so the event
+// should be applied normally like any other slider move.
+func (m *sessionMap) handlePositionSyncEvent(event SliderMoveEvent) bool {
+	m.takeoverMu.Lock()
+	state, active := m.channelTakeover[event.SliderID]
+	awaiting := m.awaitingPositionBaseline[event.SliderID]
+	m.takeoverMu.Unlock()
+
+	if active {
+		m.advanceTakeover(event.SliderID, state, event.PercentValue)
+		return true
+	}
+
+	if !awaiting {
+		return false
+	}
+
+	// Still waiting for a trustworthy baseline. A reading of exactly 0 might just
+	// mean the slider is muted - firmware fakes 0 on the wire while muted,
+	// regardless of true physical position - and the host has no separate signal
+	// to tell the two apart. Keep waiting rather than risk zeroing out apps that
+	// aren't actually at 0; the first nonzero reading (whether from an unmute or
+	// genuine movement) becomes the trustworthy baseline instead.
+	if event.PercentValue == 0 {
+		return true
+	}
+
+	m.takeoverMu.Lock()
+	delete(m.awaitingPositionBaseline, event.SliderID)
+	m.takeoverMu.Unlock()
+
+	return m.armPositionSync(event.SliderID, event.PercentValue)
+}
+
+// armPositionSync compares slider sliderID's just-established physical position
+// against the current volume of every app mapped to it. Apps within
+// takeoverMatchTolerance are left alone; anything further off is split into an
+// "above" and "below" pile and a takeover sequence is armed, prioritizing the
+// "above" pile first per the design decision in CLAUDE.md. Returns true if it
+// armed (this event is fully consumed) or false if everything already matched
+// closely enough (let the event apply normally, same as any other move).
+func (m *sessionMap) armPositionSync(sliderID int, position float32) bool {
+	targets, ok := m.deej.config.SliderMapping.get(sliderID)
+	if !ok {
+		return false
+	}
+
+	var up, down []*takeoverEntry
+	for _, target := range targets {
+		for _, resolvedTarget := range m.resolveTarget(target) {
+			sessions, ok := m.get(resolvedTarget)
+			if !ok {
+				continue
+			}
+
+			for _, session := range sessions {
+				vol := session.GetVolume()
+				diff := vol - position
+				switch {
+				case diff > takeoverMatchTolerance:
+					up = append(up, &takeoverEntry{session: session, target: vol})
+				case diff < -takeoverMatchTolerance:
+					down = append(down, &takeoverEntry{session: session, target: vol})
+				}
+				// within tolerance: already matches, nothing to capture
+			}
+		}
+	}
+
+	if len(up) == 0 && len(down) == 0 {
+		return false
+	}
+
+	state := &channelTakeoverState{up: up, down: down}
+	if len(up) > 0 {
+		state.phase = takeoverPhaseUp
+	} else {
+		state.phase = takeoverPhaseDown
+	}
+
+	m.takeoverMu.Lock()
+	m.channelTakeover[sliderID] = state
+	m.takeoverMu.Unlock()
+
+	mode := TakeoverDisplayMoveUp
+	if state.phase == takeoverPhaseDown {
+		mode = TakeoverDisplayMoveDown
+	}
+	if writer := m.deej.serial.Writer(); writer != nil {
+		if err := writer.SendChannelTakeoverDisplay(byte(sliderID-1), mode); err != nil {
+			m.logger.Warnw("Failed to show takeover display", "slider", sliderID, "error", err)
+		}
+	}
+
+	m.logger.Infow("Armed connect-time position sync", "slider", sliderID, "position", position, "up", len(up), "down", len(down))
+
+	return true
+}
+
+// advanceTakeover applies one incoming slider reading to an in-progress
+// position sync sequence: captures any not-yet-captured app in the current
+// phase whose volume the slider has now reached, keeps every already-captured
+// app (from this or an earlier phase) tracking the slider live, and flips to
+// the down phase - or clears the takeover and restores the display, if there's
+// no down phase left to run - once the current phase's apps are all captured.
+func (m *sessionMap) advanceTakeover(sliderID int, state *channelTakeoverState, value float32) {
+	entries := state.up
+	if state.phase == takeoverPhaseDown {
+		entries = state.down
+	}
+
+	allCaptured := true
+	for _, e := range entries {
+		if e.captured {
+			continue
+		}
+
+		crossed := value >= e.target
+		if state.phase == takeoverPhaseDown {
+			crossed = value <= e.target
+		}
+
+		if crossed {
+			e.captured = true
+		} else {
+			allCaptured = false
+		}
+	}
+
+	for _, pile := range [][]*takeoverEntry{state.up, state.down} {
+		for _, e := range pile {
+			if e.captured && e.session.GetVolume() != value {
+				if err := e.session.SetVolume(value); err != nil {
+					m.logger.Warnw("Failed to set target session volume during position sync", "error", err)
+				}
+			}
+		}
+	}
+
+	if !allCaptured {
+		return
+	}
+
+	writer := m.deej.serial.Writer()
+
+	if state.phase == takeoverPhaseUp && len(state.down) > 0 {
+		state.phase = takeoverPhaseDown
+		if writer != nil {
+			if err := writer.SendChannelTakeoverDisplay(byte(sliderID-1), TakeoverDisplayMoveDown); err != nil {
+				m.logger.Warnw("Failed to show takeover display", "slider", sliderID, "error", err)
+			}
+		}
+		return
+	}
+
+	m.takeoverMu.Lock()
+	delete(m.channelTakeover, sliderID)
+	m.takeoverMu.Unlock()
+
+	if writer != nil {
+		if err := writer.SendChannelTakeoverDisplay(byte(sliderID-1), TakeoverDisplayRestore); err != nil {
+			m.logger.Warnw("Failed to restore channel display", "slider", sliderID, "error", err)
+		}
+	}
+
+	m.logger.Infow("Position sync complete", "slider", sliderID)
 }
 
 func (m *sessionMap) targetHasSpecialTransform(target string) bool {

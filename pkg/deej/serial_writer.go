@@ -27,6 +27,7 @@ const (
 	cmdSetDisplayGap     = byte(0x0D)
 	cmdSetD16Action      = byte(0x0E)
 	cmdSetScreensaverTimeout = byte(0x0F)
+	cmdSetChannelTakeoverDisplay = byte(0x10)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -204,6 +205,24 @@ func (sw *SerialWriter) SendScreensaverTimeout(seconds uint16) error {
 	payload := make([]byte, 2)
 	binary.LittleEndian.PutUint16(payload, seconds)
 	return sw.send(cmdSetScreensaverTimeout, payload)
+}
+
+// TakeoverDisplayRestore, TakeoverDisplayMoveUp, and TakeoverDisplayMoveDown are
+// the valid mode values for SendChannelTakeoverDisplay.
+const (
+	TakeoverDisplayRestore  = byte(0)
+	TakeoverDisplayMoveUp   = byte(1)
+	TakeoverDisplayMoveDown = byte(2)
+)
+
+// SendChannelTakeoverDisplay tells SERENITY what to show on channel idx (0-4)
+// during the host-driven connect-time position sync check: mode is one of the
+// TakeoverDisplay* constants. Firmware owns no target values or crossing logic
+// for this - it just renders whichever screen it's told to show, reusing the
+// same full-screen arrow display the per-channel mute/unmute takeover already
+// uses. All arming/crossing decisions live host-side, in sessionMap.
+func (sw *SerialWriter) SendChannelTakeoverDisplay(idx byte, mode byte) error {
+	return sw.send(cmdSetChannelTakeoverDisplay, []byte{idx, mode})
 }
 
 func (sw *SerialWriter) send(cmdID byte, payload []byte) error {

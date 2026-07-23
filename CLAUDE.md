@@ -23,6 +23,7 @@ Legend: ✅ Verified — don't re-suggest unless listed files changed · ⬜ Not
 
 ### ⬜ Not yet verified
 
+- **Soft takeover at connect** (see "Remaining Work" → "Soft Takeover at Connect") — implemented, never flashed/bench-tested. Files: `main.cpp` (`kCmdSetChannelTakeoverDisplay` handler, `forceSend` on `kCmdQuery`), `session_map.go` (`handlePositionSyncEvent`, `armPositionSync`, `advanceTakeover`, `setupOnBeacon`), `serial_writer.go` (`SendChannelTakeoverDisplay`).
 - **Multi-device mic mute** — active bug, see "Active Bugs" below for full debug plan.
 - **`enable_logging` config gate** (commit `507603e`) — implemented, not bench-tested: does `false` actually suppress the log file write, does `Fatal`/`Fatalw` still terminate the process.
 - **Screensaver disable delay** (commit `4d4212d`) — implemented, not bench-tested on hardware.
@@ -116,6 +117,7 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 | `SET_DISPLAY_GAP` | `0x0D` | `[gap]` | Inter-display dead pixel count, uint8, 0–100. Firmware stores in EEPROM. Pushed on every beacon. |
 | `SET_D16_ACTION` | `0x0E` | `[single][double][triple]` | D16 button (PF7) gesture → action mapping, mirrors SET_GESTURE_CONFIG's payload shape and action IDs. Defaults: MasterVolMute/PlayPause/SkipForward. Pushed on every beacon. |
 | `SET_SCREENSAVER_TIMEOUT` | `0x0F` | `[s_lo][s_hi]` | Idle timeout before screensaver engages, uint16 LE, seconds. Default 180; host enforces 30–1800. Persisted to firmware EEPROM. Pushed on every beacon. |
+| `SET_CHANNEL_TAKEOVER_DISPLAY` | `0x10` | `[channel_idx][mode]` | Display-only remote control for the connect-time position sync check: mode `0x00`=restore normal display, `0x01`=show "MOVE UP", `0x02`=show "MOVE DOWN". Firmware holds no target/crossing logic for this — host owns it entirely and just tells firmware what to render. See "Soft Takeover at Connect" below. |
 
 **Firmware → host CMD_IDs:**
 
@@ -125,7 +127,7 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 | `CMD_REQUEST_MASTER_MUTE_TOGGLE` | `0x08` | none | Encoder single-click: perform OS-level master mute toggle |
 | `CMD_REQUEST_MIC_MUTE_ACTION` | `0x0A` | `[desired_state]` | Gesture-mapped mic mute/unmute. `0x00`=mute, `0x01`=unmute. |
 
-The two directions are independent namespaces. CMD_IDs `0x06`, `0x08`, `0x0A` are unassigned host→firmware; `0x09`, `0x0B`, `0x0C`, `0x0D`, `0x0E` are unassigned firmware→host.
+The two directions are independent namespaces. CMD_IDs `0x06`, `0x08`, `0x0A` are unassigned host→firmware; `0x09`, `0x0B`, `0x0C`, `0x0D`, `0x0E`, `0x10` are unassigned firmware→host.
 
 ### Connection & Push
 
@@ -340,9 +342,22 @@ Likely plugs into `applyTargetTransform()` in `session_map.go` alongside existin
 
 Currently icon lookup is keyed off `targets[0]` from `slider_mapping` (lowercased, `.exe` stripped) — channel label has no effect. Idea: optional explicit icon key per channel, defaulting to current behavior. Overlaps with process group feature. Open questions: config shape, precedence, ordering relative to process groups.
 
-### Soft Takeover — NOT DESIGNED
+### Soft Takeover at Connect — implemented, not yet bench-verified
 
-Move takeover logic to host (currently firmware-only for per-channel mute) and extend to connect-time: faders 1–5 currently snap-jump on connect; could freeze at app setpoint until the physical fader crosses it. Open: exact protocol changes needed, multi-session slider target resolution, whether this replaces snap-jump outright or is config-gated.
+Prevents session volume from snap-jumping to a physical fader's position on connect/reconnect, when the fader doesn't match where the mapped app(s) already are. Distinct from, and independent of, the per-channel mute/unmute soft takeover (firmware-local, see firmware CLAUDE.md "Per-Channel Soft Takeover") — this one is entirely host-driven; firmware only renders whichever screen it's told to via `SET_CHANNEL_TAKEOVER_DISPLAY` (0x10, see protocol table above), reusing the mute/unmute feature's own `drawChannelTakeover()`/`restoreChannelDisplay()` display functions with no new drawing code and no shared state.
+
+**Design, per-app independent capture (not a single representative value):** a slider can map to more than one app. Rather than collapsing them to one number to compare (e.g. an average — rejected: it can force a currently-quiet app louder to meet the average), each mapped app's volume is checked independently against the physical fader position and captured on its own as the fader crosses it:
+- At the moment a slider's baseline physical position is established (see below), every mapped app whose volume differs from that position by more than 1% is split into an "above" pile or a "below" pile; anything within 1% is left alone entirely (already close enough, never touched).
+- If the "above" pile is non-empty, `SET_CHANNEL_TAKEOVER_DISPLAY` mode 1 ("MOVE UP") fires first; otherwise mode 2 ("MOVE DOWN") if the "below" pile is non-empty. Apps not yet captured are completely untouched — no volume commands sent for them at all — while the fader is en route.
+- As the fader moves and crosses an uncaptured app's volume (`value >= target` while moving up, `value <= target` while moving down), that one app is captured and starts tracking the live fader value from then on, exactly like a normal slider move. Already-captured apps (from this phase or an earlier one) keep tracking live every event.
+- Once every app in the current phase is captured: if the other pile still has entries, the display flips to that direction and the process continues; otherwise the takeover clears (mode 0, restore) and the slider returns to fully normal operation.
+- Implemented in `session_map.go`: `channelTakeoverState`/`takeoverEntry`/`takeoverPhase` types, `armPositionSync()` (builds the piles and arms), `advanceTakeover()` (per-event capture/phase-flip/resolve), both called from `handleSliderMoveEvent()` via `handlePositionSyncEvent()`, which intercepts fader sliders (1..NumSliders; slider 0/master never participates — it has its own separate sync via `SET_MASTER_VOLUME`/`pushMasterState`) before the normal per-target apply path runs.
+
+**Establishing the physical baseline:** the host has no way to know a fader's physical position at connect on its own — firmware only transmits on value change. `kCmdQuery`'s firmware handler now sets `forceSend = true`, so a real fader line goes out on the very next loop iteration after every `CMD_QUERY` (i.e. every connect/reconnect), instead of waiting for the user to touch something.
+
+**Muted channels — no dedicated hardware signal, handled via a wait-for-nonzero rule instead:** per-channel mute (the WASH buttons) is entirely firmware-local (see firmware CLAUDE.md "Per-Channel Volume Mute") and firmware never tells the host when a mute button is pressed or released — a muted channel just reports 0 on the wire regardless of true position, indistinguishable on the wire from a channel that's genuinely resting at 0. Rather than add a new firmware signal for this, the host just waits: on every (re)connect, every fader slider is marked "awaiting baseline" (`sessionMap.awaitingPositionBaseline`), and a reading of exactly 0 is never treated as a trustworthy baseline — it's ignored and the slider keeps waiting. The first nonzero reading (whether from an unmute or genuine physical movement away from a true 0 rest position) becomes the baseline and runs the comparison above. This also means: if a channel gets muted mid-sequence, the mute forces 0 on the wire same as always, silencing everything on that slider (expected mute behavior) — no special pause/resume logic needed, since the next unmute just re-establishes the baseline and re-runs the check fresh.
+
+**Scope:** runs on every (re)connect — first launch, USB replug, app-level reconnect — not just cold boot, matching how `pushAll(force=true)` already re-syncs names/icons on every reconnect. Reset (any stuck-mid-sequence takeover dropped, display restored, all sliders re-armed to "awaiting baseline") happens in `sessionMap.setupOnBeacon()`, subscribed to the same beacon event as everything else that resyncs on connect.
 
 ---
 
